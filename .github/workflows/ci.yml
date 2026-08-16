@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4']
+        laravel: ['11', '12', '13']
+        exclude:
+          # orchestra/testbench ^11 (Laravel 13) requires php >= 8.3.
+          - php: '8.2'
+            laravel: '13'
+    name: PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+
+      - name: Constrain to Laravel ${{ matrix.laravel }}
+        run: |
+          composer require --no-update --dev \
+            "orchestra/testbench:${{ matrix.laravel == '11' && '^9.0' || matrix.laravel == '12' && '^10.0' || '^11.0' }}"
+          composer require --no-update \
+            "illuminate/contracts:^${{ matrix.laravel }}.0"
+
+      - name: Install
+        run: composer update --prefer-dist --no-interaction --no-progress
+
+      - name: Pint
+        run: vendor/bin/pint --test
+
+      - name: PHPStan
+        run: vendor/bin/phpstan analyse --memory-limit=512M
+
+      - name: PHPUnit
+        run: vendor/bin/phpunit
