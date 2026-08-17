@@ -109,6 +109,34 @@ final class MaintenancePayloadTest extends TestCase
         MaintenancePayload::fromArray($body);
     }
 
+    /**
+     * M2: DateTimeImmutable::createFromFormat silently rolls impossible
+     * dates over into the next valid one instead of failing — 2026-02-31
+     * becomes 2026-03-03. That must be rejected loudly, per this class's own
+     * docblock, not turned into a plausible-looking but wrong Retry-After.
+     */
+    public function testFromArrayRejectsAnImpossibleStartsAtInsteadOfRollingItOver(): void
+    {
+        $body = $this->validBody();
+        $body['starts_at'] = '2026-02-31T00:00:00Z';
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unparseable "starts_at"');
+
+        MaintenancePayload::fromArray($body);
+    }
+
+    public function testFromArrayRejectsAnImpossibleEndsAtInsteadOfRollingItOver(): void
+    {
+        $body = $this->validBody();
+        $body['ends_at'] = '2026-13-45T99:00:00Z';
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unparseable "ends_at"');
+
+        MaintenancePayload::fromArray($body);
+    }
+
     public function testRetryAfterSecondsReturnsRealRemainderMidWindow(): void
     {
         /** @var array<string, mixed> $body */

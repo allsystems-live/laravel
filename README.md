@@ -45,6 +45,8 @@ This package has no opinion on, and no configuration for, which driver backs Lar
 
 One real consequence of driving the contract through `MaintenanceMode::activate()` rather than `artisan down`: the pre-rendered `storage/framework/maintenance.php` short-circuit file is **not** written. Requests still boot the framework — which is precisely what lets the webhook route stay reachable and lets the app come back up when `maintenance.ended` arrives.
 
+A leftover `storage/framework/maintenance.php` from an earlier `artisan down` changes how requests are served — delete it or run `artisan up` once before adopting this package.
+
 ## Events
 
 Three events are dispatched, always, regardless of `maintenance.enabled`:

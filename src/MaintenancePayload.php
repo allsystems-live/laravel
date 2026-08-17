@@ -93,7 +93,7 @@ final readonly class MaintenancePayload
         $raw = self::string($source, $key);
         $parsed = DateTimeImmutable::createFromFormat('Y-m-d\TH:i:s\Z', $raw, new DateTimeZone('UTC'));
 
-        if ($parsed === false) {
+        if ($parsed === false || $parsed->format('Y-m-d\TH:i:s\Z') !== $raw) {
             throw new InvalidArgumentException(sprintf('Unparseable "%s" in the AllSystems webhook payload: %s', $key, $raw));
         }
 

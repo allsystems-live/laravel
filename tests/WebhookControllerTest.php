@@ -24,6 +24,8 @@ final class WebhookControllerTest extends TestCase
 
     private const VALID_MAINTENANCE_BODY = '{"id":"01920000-0000-7000-8000-00000000a001","event":"maintenance.started","title":"Database upgrade","message":"Upgrading PostgreSQL.","starts_at":"2026-08-20T01:00:00Z","ends_at":"2026-08-20T01:30:00Z","components":[]}';
 
+    private const VALID_MAINTENANCE_ENDED_BODY = '{"id":"01920000-0000-7000-8000-00000000a001","event":"maintenance.ended","title":"Database upgrade","message":"Upgrading PostgreSQL.","starts_at":"2026-08-20T01:00:00Z","ends_at":"2026-08-20T01:30:00Z","components":[]}';
+
     private const PING_BODY = '{"event":"ping","application":{"id":"01920000-0000-7000-8000-00000000b001","name":"Storefront"}}';
 
     public function testSignedMaintenanceStartedDispatchesExactlyOneEventAndReturnsOk(): void
@@ -62,8 +64,8 @@ final class WebhookControllerTest extends TestCase
             [],
             [],
             [],
-            $this->signedHeaders('maintenance.ended', self::VALID_MAINTENANCE_BODY),
-            self::VALID_MAINTENANCE_BODY,
+            $this->signedHeaders('maintenance.ended', self::VALID_MAINTENANCE_ENDED_BODY),
+            self::VALID_MAINTENANCE_ENDED_BODY,
         )
             ->assertOk()
             ->assertJson(['ok' => true])
@@ -150,6 +152,74 @@ final class WebhookControllerTest extends TestCase
     public function testGetIsMethodNotAllowed(): void
     {
         $this->get(self::PATH)->assertStatus(405);
+    }
+
+    /**
+     * I1: the signature covers the body, not the X-AllSystems-Event header
+     * that actually drives routing. Without the cross-check, a captured
+     * `maintenance.started` delivery is byte-for-byte a valid
+     * `maintenance.ended` with only the header flipped.
+     */
+    public function testFlippingTheEventHeaderOnASignedBodyIsRejected(): void
+    {
+        Event::fake();
+
+        $timestamp = time();
+        $v1 = hash_hmac('sha256', $timestamp . '.' . self::VALID_MAINTENANCE_BODY, self::SECRET);
+        $signature = "t={$timestamp},v1={$v1}";
+
+        $startedHeaders = $this->transformHeadersToServerVars([
+            VerifySignature::HEADER => $signature,
+            'X-AllSystems-Event' => 'maintenance.started',
+        ]);
+
+        $this->call('POST', self::PATH, [], [], [], $startedHeaders, self::VALID_MAINTENANCE_BODY)
+            ->assertOk()
+            ->assertJson(['ok' => true])
+        ;
+
+        $endedHeaders = $this->transformHeadersToServerVars([
+            VerifySignature::HEADER => $signature,
+            'X-AllSystems-Event' => 'maintenance.ended',
+        ]);
+
+        $this->call('POST', self::PATH, [], [], [], $endedHeaders, self::VALID_MAINTENANCE_BODY)
+            ->assertStatus(400)
+        ;
+
+        Event::assertDispatchedTimes(MaintenanceStarted::class, 1);
+        Event::assertNotDispatched(MaintenanceEnded::class);
+    }
+
+    /**
+     * M1 (folded into I1): a scalar-bodied signed request must be a 400, not
+     * the 500 that fell out of MaintenancePayload::fromArray()'s array type
+     * hint when handed an int or a string.
+     */
+    public function testSignedMaintenanceStartedWithScalarBodyReturns400(): void
+    {
+        Event::fake();
+
+        $body = '5';
+
+        $this->call('POST', self::PATH, [], [], [], $this->signedHeaders('maintenance.started', $body), $body)
+            ->assertStatus(400)
+        ;
+
+        $this->assertNoneOfOurEventsWereDispatched();
+    }
+
+    public function testSignedPingWithScalarBodyReturns400(): void
+    {
+        Event::fake();
+
+        $body = '"hello"';
+
+        $this->call('POST', self::PATH, [], [], [], $this->signedHeaders('ping', $body), $body)
+            ->assertStatus(400)
+        ;
+
+        $this->assertNoneOfOurEventsWereDispatched();
     }
 
     private function assertNoneOfOurEventsWereDispatched(): void

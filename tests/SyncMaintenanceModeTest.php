@@ -70,7 +70,7 @@ final class SyncMaintenanceModeTest extends TestCase
         self::assertCount(1, $fake->activations);
         $activation = $fake->activations[0];
 
-        self::assertSame([], $activation['except']);
+        self::assertSame(['allsystems/webhook'], $activation['except']);
         self::assertNull($activation['redirect']);
         self::assertIsInt($activation['retry']);
         self::assertGreaterThanOrEqual(1795, $activation['retry']);
@@ -117,6 +117,31 @@ final class SyncMaintenanceModeTest extends TestCase
         self::assertStringNotContainsString('maintenance-window', $template);
     }
 
+    /**
+     * I3: the produced payload's `except` must mirror what the provider
+     * registered with PreventRequestsDuringMaintenance, not an empty array —
+     * otherwise a leftover storage/framework/maintenance.php stub from an
+     * earlier `artisan down` can permanently swallow the `ended` webhook.
+     */
+    public function testStartedActivatesWithANonEmptyExceptListContainingTheWebhookPath(): void
+    {
+        config(['allsystems.maintenance.template' => 'maintenance-window']);
+
+        $app = $this->app;
+        assert($app !== null);
+        $app->make(ViewFactory::class)->addLocation(__DIR__ . '/views');
+
+        $fake = $this->bindFake();
+        $payload = $this->payload('window-13', (new DateTimeImmutable())->modify('+1800 seconds'));
+
+        $this->dispatch(new MaintenanceStarted($payload));
+
+        $except = $fake->activations[0]['except'];
+        self::assertIsArray($except);
+        self::assertNotEmpty($except);
+        self::assertContains('allsystems/webhook', $except);
+    }
+
     public function testStartedRetryFloorsAtSixtySecondsWhenTheWindowHasAlreadyEnded(): void
     {
         $fake = $this->bindFake();
@@ -125,6 +150,23 @@ final class SyncMaintenanceModeTest extends TestCase
         $this->dispatch(new MaintenanceStarted($payload));
 
         self::assertSame(60, $fake->activations[0]['retry']);
+    }
+
+    /**
+     * M3: a non-numeric refresh value must produce `null`, not `0` — a
+     * `Refresh: 0` header tells browsers to reload immediately, in a loop,
+     * for the whole maintenance window.
+     */
+    public function testStartedWithNonNumericRefreshConfigProducesNullNotZero(): void
+    {
+        config(['allsystems.maintenance.refresh' => 'not-a-number']);
+
+        $fake = $this->bindFake();
+        $payload = $this->payload('window-14', (new DateTimeImmutable())->modify('+1800 seconds'));
+
+        $this->dispatch(new MaintenanceStarted($payload));
+
+        self::assertNull($fake->activations[0]['refresh']);
     }
 
     public function testStartedAlreadyActiveWithTheSameIdDoesNotReactivate(): void
@@ -193,6 +235,38 @@ final class SyncMaintenanceModeTest extends TestCase
         $this->dispatch(new MaintenanceEnded($this->payload('window-8')));
 
         self::assertSame(0, $fake->deactivateCalls, 'A hand-run artisan down must never be lifted by an AllSystems window ending.');
+        self::assertSame('noop', $this->syncResult()->action);
+    }
+
+    /**
+     * The composed case C1 fixes: a foreign maintenance mode (no
+     * allsystems_maintenance_id at all) is active when `started` arrives.
+     * `started` must not take it over — and because it doesn't, the matching
+     * `ended` has nothing of ours to lift either.
+     */
+    public function testStartedDoesNotTakeOverAForeignMaintenanceModeAndSubsequentEndedDoesNotLiftIt(): void
+    {
+        $fake = $this->bindFake();
+        $fake->activate([
+            'except' => [],
+            'redirect' => null,
+            'retry' => 60,
+            'refresh' => null,
+            'secret' => 'let-me-in',
+            'status' => 503,
+            'template' => null,
+        ]);
+
+        $this->dispatch(new MaintenanceStarted($this->payload('window-12')));
+
+        self::assertCount(1, $fake->activations, 'started must not call activate() over a foreign maintenance mode.');
+        self::assertSame('noop', $this->syncResult()->action);
+        self::assertTrue($fake->active());
+
+        $this->dispatch(new MaintenanceEnded($this->payload('window-12')));
+
+        self::assertSame(0, $fake->deactivateCalls, 'A foreign maintenance mode must never be lifted by AllSystems.');
+        self::assertTrue($fake->active());
         self::assertSame('noop', $this->syncResult()->action);
     }
 

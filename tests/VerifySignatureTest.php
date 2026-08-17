@@ -171,6 +171,10 @@ final class VerifySignatureTest extends TestCase
 
         return $this->transformHeadersToServerVars([
             VerifySignature::HEADER => "t={$timestamp},v1={$v1}",
+            // Every body signed in this file declares "event":"ping" (or no
+            // event at all, for the requests VerifySignature itself rejects
+            // before the controller's event/header cross-check ever runs).
+            'X-AllSystems-Event' => 'ping',
         ]);
     }
 }

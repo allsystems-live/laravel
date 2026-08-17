@@ -11,6 +11,7 @@ use DateTimeImmutable;
 use Illuminate\Contracts\Config\Repository as ConfigRepository;
 use Illuminate\Contracts\Foundation\MaintenanceMode;
 use Illuminate\Contracts\View\Factory as ViewFactory;
+use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance;
 
 /**
  * Drives Laravel's own maintenance mode from an AllSystems window.
@@ -36,16 +37,27 @@ final readonly class SyncMaintenanceMode
         private ConfigRepository $config,
         private ViewFactory $views,
         private SyncResult $result,
+        private PreventRequestsDuringMaintenance $exemptions,
     ) {
     }
 
     public function handleStarted(MaintenanceStarted $event): void
     {
         $payload = $event->payload;
+        $active = $this->maintenanceMode->active();
+        $data = $active ? $this->maintenanceMode->data() : [];
 
-        if ($this->maintenanceMode->active() && ($this->maintenanceMode->data()[self::ID_KEY] ?? null) === $payload->id) {
+        if ($active && ($data[self::ID_KEY] ?? null) === $payload->id) {
             // A redelivery of a window we already applied. At-least-once
             // delivery makes this normal, not exceptional.
+            $this->result->action = 'noop';
+
+            return;
+        }
+
+        if ($active && !array_key_exists(self::ID_KEY, $data)) {
+            // Not ours (a hand-run `artisan down`, or another package). Not ours
+            // to take over, and therefore not ours to lift later.
             $this->result->action = 'noop';
 
             return;
@@ -58,7 +70,7 @@ final readonly class SyncMaintenanceMode
         // The keys mirror Illuminate\Foundation\Console\DownCommand exactly, so
         // an AllSystems-driven down behaves the same as `artisan down`.
         $this->maintenanceMode->activate([
-            'except' => [],
+            'except' => $this->exemptions->getExcludedPaths(),
             'redirect' => self::nullableString($this->config->get('allsystems.maintenance.redirect')),
             'retry' => $retry,
             'refresh' => self::nullableInt($this->config->get('allsystems.maintenance.refresh')),
@@ -115,6 +127,6 @@ final readonly class SyncMaintenanceMode
 
     private static function nullableInt(mixed $value): ?int
     {
-        return is_int($value) || (is_string($value) && $value !== '') ? (int) $value : null;
+        return is_numeric($value) ? (int) $value : null;
     }
 }

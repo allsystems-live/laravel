@@ -38,13 +38,30 @@ final readonly class WebhookController
     public function __invoke(Request $request): JsonResponse
     {
         try {
-            /** @var array<string, mixed> $body */
-            $body = json_decode($request->getContent(), true, 512, JSON_THROW_ON_ERROR);
+            $decoded = json_decode($request->getContent(), true, 512, JSON_THROW_ON_ERROR);
         } catch (JsonException) {
             return new JsonResponse(['ok' => false, 'error' => 'Body is not valid JSON.'], 400);
         }
 
+        if (!is_array($decoded)) {
+            // A scalar-bodied signed request was a 500 (TypeError out of
+            // MaintenancePayload::fromArray's array type hint), not a 400.
+            return new JsonResponse(['ok' => false, 'error' => 'Body must be a JSON object.'], 400);
+        }
+
+        /** @var array<string, mixed> $body */
+        $body = $decoded;
+
         $event = $request->headers->get('X-AllSystems-Event', '');
+
+        $declaredEvent = $body['event'] ?? null;
+
+        if (is_string($declaredEvent) && $declaredEvent !== $event) {
+            // The signature covers the body, not this header. Without this check
+            // a captured `maintenance.started` delivery is byte-for-byte a valid
+            // `maintenance.ended` with the header flipped.
+            return new JsonResponse(['ok' => false, 'error' => 'Event header does not match the signed body.'], 400);
+        }
 
         try {
             match ($event) {

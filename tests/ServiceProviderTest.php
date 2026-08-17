@@ -46,6 +46,14 @@ final class ServiceProviderTest extends TestCase
         if ($this->name() === 'testConsumerPathOverrideMovesTheRoute') {
             $app->make(ConfigRepository::class)->set('allsystems.path', 'custom/hook');
         }
+
+        if ($this->name() === 'testEmptyConfiguredPathFallsBackToTheDefaultAndDoesNotExemptTheHomePage') {
+            $app->make(ConfigRepository::class)->set('allsystems.path', '');
+        }
+
+        if ($this->name() === 'testWildcardConfiguredPathFallsBackToTheDefaultAndDoesNotExemptTheHomePage') {
+            $app->make(ConfigRepository::class)->set('allsystems.path', '*');
+        }
     }
 
     public function testConfigMergesWithTheDocumentedDefaults(): void
@@ -95,6 +103,70 @@ final class ServiceProviderTest extends TestCase
             ->assertOk()
         ;
         $this->get('/')->assertServiceUnavailable();
+    }
+
+    /**
+     * I2: an empty configured path (unset, blank `.env` value, or a
+     * config:cache without publishing) must fall back to the documented
+     * default rather than relocating the route to the site root and
+     * exempting it from maintenance mode.
+     */
+    public function testEmptyConfiguredPathFallsBackToTheDefaultAndDoesNotExemptTheHomePage(): void
+    {
+        self::assertSame('allsystems/webhook', config('allsystems.path'));
+
+        $app = $this->app;
+        assert($app !== null);
+
+        $kernel = $app->make(HttpKernelContract::class);
+        assert($kernel instanceof FoundationHttpKernel);
+        $kernel->pushMiddleware(PreventRequestsDuringMaintenance::class);
+
+        $app->make(MaintenanceMode::class)->activate(['except' => [], 'status' => 503]);
+
+        $this->call('POST', '/allsystems/webhook', [], [], [], $this->signedHeaders('[]'), '[]')
+            ->assertOk()
+        ;
+        $this->get('/')->assertServiceUnavailable();
+    }
+
+    /**
+     * I2: a wildcarded path would hand PreventRequestsDuringMaintenance::except
+     * the whole app; it must be rejected the same way an empty path is.
+     */
+    public function testWildcardConfiguredPathFallsBackToTheDefaultAndDoesNotExemptTheHomePage(): void
+    {
+        self::assertSame('allsystems/webhook', config('allsystems.path'));
+
+        $app = $this->app;
+        assert($app !== null);
+
+        $kernel = $app->make(HttpKernelContract::class);
+        assert($kernel instanceof FoundationHttpKernel);
+        $kernel->pushMiddleware(PreventRequestsDuringMaintenance::class);
+
+        $app->make(MaintenanceMode::class)->activate(['except' => [], 'status' => 503]);
+
+        $this->call('POST', '/allsystems/webhook', [], [], [], $this->signedHeaders('[]'), '[]')
+            ->assertOk()
+        ;
+        $this->get('/')->assertServiceUnavailable();
+    }
+
+    /**
+     * I2: exactly one entry — the second, '/'-prefixed variant that used to
+     * be registered was redundant for a normal path (inExceptArray() trims
+     * slashes off each pattern itself) and actively wrong for the empty-path
+     * case (it matched the site root).
+     */
+    public function testExemptedPathsListHasExactlyOneEntryForANormalConfiguredPath(): void
+    {
+        $app = $this->app;
+        assert($app !== null);
+
+        $exemptions = $app->make(PreventRequestsDuringMaintenance::class);
+
+        self::assertSame(['allsystems/webhook'], $exemptions->getExcludedPaths());
     }
 
     /** @return array<string, string> */

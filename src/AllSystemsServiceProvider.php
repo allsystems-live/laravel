@@ -27,6 +27,19 @@ final class AllSystemsServiceProvider extends ServiceProvider
             __DIR__ . '/../config/allsystems.php' => $this->app->configPath('allsystems.php'),
         ], 'allsystems-config');
 
+        $configuredPath = $config->get('allsystems.path', 'allsystems/webhook');
+        $path = is_string($configuredPath) ? trim($configuredPath, '/') : '';
+
+        if ($path === '' || str_contains($path, '*')) {
+            // Empty (unset, blank .env value, or config:cache without publishing)
+            // or wildcarded (which would hand PreventRequestsDuringMaintenance::except
+            // the whole app) both fall back to the documented default rather than
+            // relocating the route to the site root or exempting everything.
+            $path = 'allsystems/webhook';
+        }
+
+        $config->set('allsystems.path', $path);
+
         $this->loadRoutesFrom(__DIR__ . '/../routes/webhook.php');
 
         // THE non-obvious one. PreventRequestsDuringMaintenance is in Laravel's
@@ -39,9 +52,11 @@ final class AllSystemsServiceProvider extends ServiceProvider
         // Registered unconditionally, even when maintenance.enabled is false:
         // an app that handles the events itself is even more likely to be down
         // when the `ended` arrives.
-        $configuredPath = $config->get('allsystems.path', 'allsystems/webhook');
-        $path = is_string($configuredPath) ? $configuredPath : 'allsystems/webhook';
-        PreventRequestsDuringMaintenance::except([$path, '/' . ltrim($path, '/')]);
+        //
+        // One entry: inExceptArray() trims leading/trailing slashes off each
+        // pattern itself, so a second '/'-prefixed variant is redundant and (for
+        // the empty-path case) was actively wrong — it matched the site root.
+        PreventRequestsDuringMaintenance::except([$path]);
 
         if ((bool) $config->get('allsystems.maintenance.enabled', true)) {
             $events->listen(MaintenanceStarted::class, [SyncMaintenanceMode::class, 'handleStarted']);
