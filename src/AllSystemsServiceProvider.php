@@ -17,6 +17,8 @@ final class AllSystemsServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/allsystems.php', 'allsystems');
+
+        $this->app->scoped(SyncResult::class);
     }
 
     public function boot(ConfigRepository $config, Dispatcher $events): void
