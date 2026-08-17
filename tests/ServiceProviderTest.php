@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace AllSystems\Laravel\Tests;
 
+use AllSystems\Laravel\Http\Middleware\VerifySignature;
 use Illuminate\Contracts\Config\Repository as ConfigRepository;
 use Illuminate\Contracts\Foundation\MaintenanceMode;
 use Illuminate\Contracts\Http\Kernel as HttpKernelContract;
@@ -56,7 +57,9 @@ final class ServiceProviderTest extends TestCase
 
     public function testConsumerPathOverrideMovesTheRoute(): void
     {
-        $this->postJson('/custom/hook')->assertOk();
+        $this->call('POST', '/custom/hook', [], [], [], $this->signedHeaders('[]'), '[]')
+            ->assertOk()
+        ;
         $this->postJson('/allsystems/webhook')->assertNotFound();
     }
 
@@ -88,7 +91,20 @@ final class ServiceProviderTest extends TestCase
             'status' => 503,
         ]);
 
-        $this->postJson('/allsystems/webhook')->assertOk();
+        $this->call('POST', '/allsystems/webhook', [], [], [], $this->signedHeaders('[]'), '[]')
+            ->assertOk()
+        ;
         $this->get('/')->assertServiceUnavailable();
+    }
+
+    /** @return array<string, string> */
+    private function signedHeaders(string $body): array
+    {
+        $timestamp = time();
+        $v1 = hash_hmac('sha256', $timestamp . '.' . $body, self::SECRET);
+
+        return $this->transformHeadersToServerVars([
+            VerifySignature::HEADER => "t={$timestamp},v1={$v1}",
+        ]);
     }
 }
