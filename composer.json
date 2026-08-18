@@ -1,0 +1,53 @@
+{
+    "name": "allsystems/laravel",
+    "description": "Receive AllSystems maintenance webhooks and drive Laravel's maintenance mode automatically.",
+    "keywords": ["laravel", "maintenance-mode", "status-page", "webhook", "allsystems"],
+    "homepage": "https://github.com/allsystems-live/laravel",
+    "license": "MIT",
+    "require": {
+        "php": "^8.2",
+        "illuminate/config": "^12.0 || ^13.0",
+        "illuminate/contracts": "^12.0 || ^13.0",
+        "illuminate/http": "^12.0 || ^13.0",
+        "illuminate/routing": "^12.0 || ^13.0",
+        "illuminate/support": "^12.0 || ^13.0"
+    },
+    "require-dev": {
+        "laravel/pint": "^1.27",
+        "orchestra/testbench": "^10.0 || ^11.0",
+        "phpstan/phpstan": "^2.1",
+        "phpunit/phpunit": "^11.0 || ^12.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "AllSystems\\Laravel\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "AllSystems\\Laravel\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "format": "vendor/bin/pint",
+        "analyse": "vendor/bin/phpstan analyse --memory-limit=512M",
+        "test": "vendor/bin/phpunit",
+        "check": [
+            "vendor/bin/pint --test",
+            "@analyse",
+            "@test"
+        ]
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "AllSystems\\Laravel\\AllSystemsServiceProvider"
+            ]
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
