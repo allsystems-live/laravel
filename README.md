@@ -2,6 +2,12 @@
 
 Receive [AllSystems](https://github.com/allsystems-live) maintenance webhooks and drive Laravel's own maintenance mode automatically.
 
+## Requirements
+
+PHP ^8.2, Laravel ^12.0 || ^13.0.
+
+Laravel 11 is not supported: every `laravel/framework` 11.x release ever published is affected by at least one security advisory that Laravel never backported a fix for on the 11.x line (11 is EOL), so Composer's default security-advisory install block refuses to resolve it — there is no non-vulnerable 11.x version to depend on. See `.github/workflows/ci.yml` for the CI matrix this is verified against.
+
 ## What it does
 
 A tenant schedules a maintenance window in AllSystems. AllSystems posts a signed webhook to your application when the window starts and when it ends. This package verifies the signature and puts your Laravel app into, and back out of, maintenance mode via `Illuminate\Contracts\Foundation\MaintenanceMode` — nobody runs `artisan down`.
