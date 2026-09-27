@@ -70,5 +70,5 @@ Branch and PR rules are in `CLAUDE.md`.
 
 - Rules: `CLAUDE.md`.
 - Full webhook contract, config reference, events and golden HMAC test vector: `docs/webhook-contract.md`.
-- Specs: `docs/superpowers/specs/{proposed,active,done}`.
-- Plans: `docs/superpowers/plans`.
+- Specs: `docs/superpowers/specs/{proposed,active,done}` (not present in this repo yet; the estate convention).
+- Plans: `docs/superpowers/plans` (not present in this repo yet; the estate convention).
