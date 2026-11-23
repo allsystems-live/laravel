@@ -41,10 +41,7 @@ final class AllSystemsServiceProvider extends ServiceProvider
 
         $this->loadRoutesFrom(__DIR__ . '/../routes/webhook.php');
 
-        // PreventRequestsDuringMaintenance is in Laravel's GLOBAL middleware stack, so after a hand-run
-        // `artisan down` the `maintenance.ended` webhook would 503 too. The platform window is gated by
-        // PlatformMaintenanceMiddleware instead, but this exemption keeps the webhook reachable either way.
-        //
+        // Keeps the webhook reachable after a hand-run `artisan down`, so `ended` still lands.
         // One entry: inExceptArray() trims leading/trailing slashes off each
         // pattern itself, so a second '/'-prefixed variant is redundant and (for
         // the empty-path case) was actively wrong — it matched the site root.

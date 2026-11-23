@@ -125,6 +125,17 @@ final class PlatformMaintenanceTest extends TestCase
         self::assertNull(Cache::store()->get('allsystems:platform-maintenance'));
     }
 
+    public function testTheFlagLivesUnderTheConfiguredCacheKey(): void
+    {
+        config(['allsystems.cache_key' => 'custom:key']);
+        $maintenance = $this->application()->make(PlatformMaintenance::class);
+
+        $maintenance->start('w-1');
+
+        self::assertNotNull(Cache::store()->get('custom:key'));
+        self::assertNull(Cache::store()->get('allsystems:platform-maintenance'));
+    }
+
     /** Laravel's own down-mode store must not route the per-request check to the database. */
     public function testTheMaintenanceStoreConfigIsIgnored(): void
     {

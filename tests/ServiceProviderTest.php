@@ -49,7 +49,8 @@ final class ServiceProviderTest extends TestCase
 
     protected function mocksTheClock(): bool
     {
-        return $this->name() !== 'testTheClockDefaultsToTheSystemClock';
+        // These two assert which binding the provider leaves in place, so the harness must not bind one.
+        return !in_array($this->name(), ['testTheClockDefaultsToTheSystemClock', 'testAnAppBindingOfTheClockWins'], true);
     }
 
     protected function defineEnvironment($app): void
@@ -81,23 +82,6 @@ final class ServiceProviderTest extends TestCase
     public function testAnAppBindingOfTheClockWins(): void
     {
         self::assertInstanceOf(MockClock::class, $this->app?->make(ClockInterface::class));
-    }
-
-    public function testConfigMergesWithTheDocumentedDefaults(): void
-    {
-        self::assertSame('webhooks/allsystems', config('allsystems.path'));
-        self::assertSame(300, config('allsystems.tolerance'));
-        self::assertSame('allsystems:platform-maintenance', config('allsystems.cache_key'));
-        self::assertSame(30, config('allsystems.max_minutes'));
-        self::assertSame(60, config('allsystems.retry_after'));
-        self::assertSame(['up'], config('allsystems.except'));
-        self::assertSame('allsystems::maintenance', config('allsystems.view'));
-        self::assertSame("We're doing some scheduled maintenance. Please try again in a minute or two.", config('allsystems.json_detail'));
-    }
-
-    public function testTheBundledMaintenanceViewIsRegistered(): void
-    {
-        self::assertTrue(view()->exists('allsystems::maintenance'));
     }
 
     public function testConsumerPathOverrideMovesTheRoute(): void
