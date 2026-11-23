@@ -47,6 +47,11 @@ final class ServiceProviderTest extends TestCase
             : parent::getPackageProviders($app);
     }
 
+    protected function mocksTheClock(): bool
+    {
+        return $this->name() !== 'testTheClockDefaultsToTheSystemClock';
+    }
+
     protected function defineEnvironment($app): void
     {
         parent::defineEnvironment($app);
@@ -80,17 +85,18 @@ final class ServiceProviderTest extends TestCase
 
     public function testConfigMergesWithTheDocumentedDefaults(): void
     {
-        self::assertSame('allsystems/webhook', config('allsystems.path'));
+        self::assertSame('webhooks/allsystems', config('allsystems.path'));
         self::assertSame(300, config('allsystems.tolerance'));
-        self::assertTrue(config('allsystems.maintenance.enabled'));
+        self::assertSame('allsystems:platform-maintenance', config('allsystems.cache_key'));
+        self::assertSame(30, config('allsystems.max_minutes'));
     }
 
     public function testConsumerPathOverrideMovesTheRoute(): void
     {
-        $this->call('POST', '/custom/hook', [], [], [], $this->signedHeaders('[]'), '[]')
+        $this->call('POST', '/custom/hook', [], [], [], $this->signedHeaders('{"event":"ping"}'), '{"event":"ping"}')
             ->assertOk()
         ;
-        $this->postJson('/allsystems/webhook')->assertNotFound();
+        $this->postJson('/webhooks/allsystems')->assertNotFound();
     }
 
     public function testTheRouteIsNamedAndCarriesOnlyVerifySignature(): void
@@ -121,7 +127,7 @@ final class ServiceProviderTest extends TestCase
             'status' => 503,
         ]);
 
-        $this->call('POST', '/allsystems/webhook', [], [], [], $this->signedHeaders('[]'), '[]')
+        $this->call('POST', '/webhooks/allsystems', [], [], [], $this->signedHeaders('{"event":"ping"}'), '{"event":"ping"}')
             ->assertOk()
         ;
         $this->get('/')->assertServiceUnavailable();
@@ -135,7 +141,7 @@ final class ServiceProviderTest extends TestCase
      */
     public function testEmptyConfiguredPathFallsBackToTheDefaultAndDoesNotExemptTheHomePage(): void
     {
-        self::assertSame('allsystems/webhook', config('allsystems.path'));
+        self::assertSame('webhooks/allsystems', config('allsystems.path'));
 
         $app = $this->app;
         assert($app !== null);
@@ -146,7 +152,7 @@ final class ServiceProviderTest extends TestCase
 
         $app->make(MaintenanceMode::class)->activate(['except' => [], 'status' => 503]);
 
-        $this->call('POST', '/allsystems/webhook', [], [], [], $this->signedHeaders('[]'), '[]')
+        $this->call('POST', '/webhooks/allsystems', [], [], [], $this->signedHeaders('{"event":"ping"}'), '{"event":"ping"}')
             ->assertOk()
         ;
         $this->get('/')->assertServiceUnavailable();
@@ -158,7 +164,7 @@ final class ServiceProviderTest extends TestCase
      */
     public function testWildcardConfiguredPathFallsBackToTheDefaultAndDoesNotExemptTheHomePage(): void
     {
-        self::assertSame('allsystems/webhook', config('allsystems.path'));
+        self::assertSame('webhooks/allsystems', config('allsystems.path'));
 
         $app = $this->app;
         assert($app !== null);
@@ -169,7 +175,7 @@ final class ServiceProviderTest extends TestCase
 
         $app->make(MaintenanceMode::class)->activate(['except' => [], 'status' => 503]);
 
-        $this->call('POST', '/allsystems/webhook', [], [], [], $this->signedHeaders('[]'), '[]')
+        $this->call('POST', '/webhooks/allsystems', [], [], [], $this->signedHeaders('{"event":"ping"}'), '{"event":"ping"}')
             ->assertOk()
         ;
         $this->get('/')->assertServiceUnavailable();
@@ -188,13 +194,13 @@ final class ServiceProviderTest extends TestCase
 
         $exemptions = $app->make(PreventRequestsDuringMaintenance::class);
 
-        self::assertSame(['allsystems/webhook'], $exemptions->getExcludedPaths());
+        self::assertSame(['webhooks/allsystems'], $exemptions->getExcludedPaths());
     }
 
     /** @return array<string, string> */
     private function signedHeaders(string $body): array
     {
-        $timestamp = time();
+        $timestamp = $this->clock->now()->getTimestamp();
         $v1 = hash_hmac('sha256', $timestamp . '.' . $body, self::SECRET);
 
         return $this->transformHeadersToServerVars([

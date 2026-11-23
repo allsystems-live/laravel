@@ -17,8 +17,6 @@ use Symfony\Component\Clock\MockClock;
 
 final class PlatformMaintenanceTest extends TestCase
 {
-    private MockClock $clock;
-
     private PlatformMaintenance $maintenance;
 
     private LegacyMockInterface $log;

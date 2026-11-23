@@ -4,11 +4,7 @@ declare(strict_types=1);
 
 namespace AllSystems\Laravel;
 
-use AllSystems\Laravel\Events\MaintenanceEnded;
-use AllSystems\Laravel\Events\MaintenanceStarted;
-use AllSystems\Laravel\Listeners\SyncMaintenanceMode;
 use Illuminate\Contracts\Config\Repository as ConfigRepository;
-use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance;
 use Illuminate\Support\ServiceProvider;
 use Psr\Clock\ClockInterface;
@@ -19,17 +15,16 @@ final class AllSystemsServiceProvider extends ServiceProvider
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/allsystems.php', 'allsystems');
 
-        $this->app->scoped(SyncResult::class);
         $this->app->bindIf(ClockInterface::class, SystemClock::class);
     }
 
-    public function boot(ConfigRepository $config, Dispatcher $events): void
+    public function boot(ConfigRepository $config): void
     {
         $this->publishes([
             __DIR__ . '/../config/allsystems.php' => $this->app->configPath('allsystems.php'),
         ], 'allsystems-config');
 
-        $configuredPath = $config->get('allsystems.path', 'allsystems/webhook');
+        $configuredPath = $config->get('allsystems.path', 'webhooks/allsystems');
         $path = is_string($configuredPath) ? trim($configuredPath, '/') : '';
 
         if ($path === '' || str_contains($path, '*')) {
@@ -37,32 +32,20 @@ final class AllSystemsServiceProvider extends ServiceProvider
             // or wildcarded (which would hand PreventRequestsDuringMaintenance::except
             // the whole app) both fall back to the documented default rather than
             // relocating the route to the site root or exempting everything.
-            $path = 'allsystems/webhook';
+            $path = 'webhooks/allsystems';
         }
 
         $config->set('allsystems.path', $path);
 
         $this->loadRoutesFrom(__DIR__ . '/../routes/webhook.php');
 
-        // THE non-obvious one. PreventRequestsDuringMaintenance is in Laravel's
-        // GLOBAL middleware stack, so once maintenance mode is active every
-        // request gets a 503 — including the `maintenance.ended` webhook that
-        // is supposed to lift it. Without this exemption the first window an
-        // app enters is the last, and it can only be recovered by hand with
-        // `artisan up`.
-        //
-        // Registered unconditionally, even when maintenance.enabled is false:
-        // an app that handles the events itself is even more likely to be down
-        // when the `ended` arrives.
+        // PreventRequestsDuringMaintenance is in Laravel's GLOBAL middleware stack, so after a hand-run
+        // `artisan down` the `maintenance.ended` webhook would 503 too. The platform window is gated by
+        // PlatformMaintenanceMiddleware instead, but this exemption keeps the webhook reachable either way.
         //
         // One entry: inExceptArray() trims leading/trailing slashes off each
         // pattern itself, so a second '/'-prefixed variant is redundant and (for
         // the empty-path case) was actively wrong — it matched the site root.
         PreventRequestsDuringMaintenance::except([$path]);
-
-        if ((bool) $config->get('allsystems.maintenance.enabled', true)) {
-            $events->listen(MaintenanceStarted::class, [SyncMaintenanceMode::class, 'handleStarted']);
-            $events->listen(MaintenanceEnded::class, [SyncMaintenanceMode::class, 'handleEnded']);
-        }
     }
 }
