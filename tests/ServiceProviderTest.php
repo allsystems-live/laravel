@@ -89,6 +89,15 @@ final class ServiceProviderTest extends TestCase
         self::assertSame(300, config('allsystems.tolerance'));
         self::assertSame('allsystems:platform-maintenance', config('allsystems.cache_key'));
         self::assertSame(30, config('allsystems.max_minutes'));
+        self::assertSame(60, config('allsystems.retry_after'));
+        self::assertSame(['up'], config('allsystems.except'));
+        self::assertSame('allsystems::maintenance', config('allsystems.view'));
+        self::assertSame("We're doing some scheduled maintenance. Please try again in a minute or two.", config('allsystems.json_detail'));
+    }
+
+    public function testTheBundledMaintenanceViewIsRegistered(): void
+    {
+        self::assertTrue(view()->exists('allsystems::maintenance'));
     }
 
     public function testConsumerPathOverrideMovesTheRoute(): void

@@ -37,6 +37,8 @@ final class AllSystemsServiceProvider extends ServiceProvider
 
         $config->set('allsystems.path', $path);
 
+        $this->loadViewsFrom(__DIR__ . '/../resources/views', 'allsystems');
+
         $this->loadRoutesFrom(__DIR__ . '/../routes/webhook.php');
 
         // PreventRequestsDuringMaintenance is in Laravel's GLOBAL middleware stack, so after a hand-run

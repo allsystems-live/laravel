@@ -1,6 +1,6 @@
 # allsystems-live/laravel
 
-Composer package: signed AllSystems maintenance webhooks driving Laravel's own maintenance mode. No deploy.
+Composer package: signed AllSystems maintenance webhooks opening a cache-flag maintenance window that a global middleware turns into 503s. No deploy.
 
 ## Commands
 

@@ -35,4 +35,16 @@ return [
 
     // Safety expiry in minutes, so a lost `ended` webhook cannot keep the app down.
     'max_minutes' => (int) env('ALLSYSTEMS_MAINTENANCE_MAX_MINUTES', 30),
+
+    // Seconds sent in the Retry-After header of the 503.
+    'retry_after' => 60,
+
+    // Paths the gate lets through during a window, besides the webhook; `up` keeps deploy smoke checks green.
+    'except' => ['up'],
+
+    // The view served as the 503 page for HTML requests.
+    'view' => 'allsystems::maintenance',
+
+    // The `detail` of the JSON:API 503 body.
+    'json_detail' => "We're doing some scheduled maintenance. Please try again in a minute or two.",
 ];

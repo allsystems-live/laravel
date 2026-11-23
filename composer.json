@@ -1,6 +1,6 @@
 {
     "name": "allsystems/laravel",
-    "description": "Receive AllSystems maintenance webhooks and drive Laravel's maintenance mode automatically.",
+    "description": "Receive AllSystems maintenance webhooks and hold a shared-cache maintenance window and answer 503 while it is open.",
     "keywords": ["laravel", "maintenance-mode", "status-page", "webhook", "allsystems"],
     "homepage": "https://github.com/allsystems-live/laravel",
     "license": "MIT",

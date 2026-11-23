@@ -1,85 +1,34 @@
 # Webhook contract and configuration reference
 
-Moved out of README.md during the 2026-09-27 README rewrite to the estate standard; content unchanged, still current.
-
 ## Configuration
 
 Every key in `config/allsystems.php`:
 
 | Key | Env var | Default |
 |---|---|---|
-| `secret` | `ALLSYSTEMS_WEBHOOK_SECRET` | *(none — required)* |
-| `path` | `ALLSYSTEMS_WEBHOOK_PATH` | `allsystems/webhook` |
+| `secret` | `ALLSYSTEMS_WEBHOOK_SECRET` | *(none, required)* |
+| `path` | `ALLSYSTEMS_WEBHOOK_PATH` | `webhooks/allsystems` |
+| `domain` | `ALLSYSTEMS_WEBHOOK_DOMAIN` | `null` (every host) |
 | `tolerance` | `ALLSYSTEMS_WEBHOOK_TOLERANCE` | `300` |
-| `maintenance.enabled` | `ALLSYSTEMS_MAINTENANCE_ENABLED` | `true` |
-| `maintenance.secret` | `ALLSYSTEMS_MAINTENANCE_BYPASS_SECRET` | `null` |
-| `maintenance.template` | `ALLSYSTEMS_MAINTENANCE_TEMPLATE` | `null` |
-| `maintenance.redirect` | `ALLSYSTEMS_MAINTENANCE_REDIRECT` | `null` |
-| `maintenance.refresh` | `ALLSYSTEMS_MAINTENANCE_REFRESH` | `null` |
+| `cache_key` | | `allsystems:platform-maintenance` |
+| `max_minutes` | `ALLSYSTEMS_MAINTENANCE_MAX_MINUTES` | `30` |
+| `retry_after` | | `60` |
+| `except` | | `['up']` |
+| `view` | | `allsystems::maintenance` |
+| `json_detail` | | `We're doing some scheduled maintenance. Please try again in a minute or two.` |
 
-`maintenance.secret`, `maintenance.template`, `maintenance.redirect` and `maintenance.refresh` are your app's own maintenance-mode configuration, passed straight through to Laravel's `MaintenanceMode::activate()` — the same options `artisan down --secret= --render= --redirect= --refresh=` accepts. AllSystems never sends any of this and never sees it.
+Publish the file with `php artisan vendor:publish --tag=allsystems-config`.
 
-Install:
+## The window
 
-```bash
-composer require allsystems/laravel
-php artisan vendor:publish --tag=allsystems-config
-```
+`maintenance.started` opens a window: a flag stored under `cache_key` in the app's default cache store, shared by every instance, so no database is read or written.
+`maintenance.ended` closes it.
+The flag expires after `max_minutes`, so a lost `ended` cannot keep the app down; the package logs a warning when it finds an expired window.
 
-Set the two env vars that matter:
+The flag carries the id of the window that opened it. A redelivered `started` for the open window is a no-op and does not extend it, and an `ended` for any other id is a no-op, so another window's delivery never closes this one.
 
-```
-ALLSYSTEMS_WEBHOOK_SECRET=whsec_...
-ALLSYSTEMS_WEBHOOK_PATH=allsystems/webhook   # optional, this is the default
-```
-
-Then, in AllSystems, register `https://your-app.example/allsystems/webhook` as the application's webhook URL and press **Send test ping**.
-
-## Maintenance drivers
-
-This package has no opinion on, and no configuration for, which driver backs Laravel's maintenance mode. That is your app's own `APP_MAINTENANCE_DRIVER` choice — file, cache, or anything else — and it is yours to make. See [Laravel's maintenance-mode documentation](https://laravel.com/docs/configuration#maintenance-mode).
-
-One real consequence of driving the contract through `MaintenanceMode::activate()` rather than `artisan down`: the pre-rendered `storage/framework/maintenance.php` short-circuit file is **not** written. Requests still boot the framework — which is precisely what lets the webhook route stay reachable and lets the app come back up when `maintenance.ended` arrives.
-
-A leftover `storage/framework/maintenance.php` from an earlier `artisan down` changes how requests are served — delete it or run `artisan up` once before adopting this package.
-
-## Events
-
-Three events are dispatched, always, regardless of `maintenance.enabled`:
-
-- **`MaintenanceStarted`** — carries a `MaintenancePayload` (`id`, `title`, `message`, `startsAt`, `endsAt`, `components`) built from the `maintenance.started` body.
-- **`MaintenanceEnded`** — carries the same `MaintenancePayload` shape, built from the `maintenance.ended` body.
-- **`PingReceived`** — carries `applicationId` and `applicationName`, built from a `ping` body.
-
-A copy-pasteable listener for an app that wants to pause its own queue workers during a window:
-
-```php
-use AllSystems\Laravel\Events\MaintenanceStarted;
-use AllSystems\Laravel\Events\MaintenanceEnded;
-use Illuminate\Support\Facades\Event;
-
-Event::listen(MaintenanceStarted::class, function (MaintenanceStarted $event) {
-    Artisan::call('queue:pause');
-});
-
-Event::listen(MaintenanceEnded::class, function (MaintenanceEnded $event) {
-    Artisan::call('queue:resume');
-});
-```
-
-Set `ALLSYSTEMS_MAINTENANCE_ENABLED=false` for apps that want these events without the package's default `SyncMaintenanceMode` behaviour — the webhook still verifies and still dispatches, only the bundled listener is not registered.
-
-## The id guard
-
-An `artisan down` you ran by hand is never lifted by AllSystems, and neither is another window's. `SyncMaintenanceMode` only calls `deactivate()` when the currently-active maintenance mode carries the id of the window it is being asked to end:
-
-```php
-final readonly class SyncMaintenanceMode
-{
-    /** The marker that makes a maintenance mode ours. */
-    public const ID_KEY = 'allsystems_maintenance_id';
-}
-```
+While the window is open, `PlatformMaintenanceMiddleware` answers every request with a 503, `Retry-After` and `Cache-Control: no-store`: the `view` page for HTML requests, a JSON:API error with code `platform_maintenance` and `json_detail` for requests that expect JSON.
+It exempts `up`, the webhook `path` and every `except` entry; exempt paths never read the cache.
 
 ## The webhook contract
 
@@ -130,7 +79,9 @@ Headers:
 { "event": "ping", "application": { "id": "...", "name": "..." } }
 ```
 
-**Idempotency.** The key is `(id, event)`. Two documented noop cases: a redelivered `maintenance.started` for a window that is already the active one is a `noop` `200`; a `maintenance.ended` for a window that is not the currently-active one (including "nothing is active") is also a `noop` `200`.
+**Responses.** Every answer is JSON. `200 {"action":"activated"}` and `{"action":"deactivated"}` when the window changed; `{"action":"noop"}` for a redelivered `started`, an `ended` for a window that is not the open one (including "nothing is open") and a `ping`; `{"action":"ignored"}` for an event type this package does not know. `401 {"error":"Invalid signature"}` and `400 {"error":"Invalid payload"}` otherwise.
+
+**Idempotency.** The key is `(id, event)`; see The window for the two noop cases.
 
 **Delivery semantics.** Any `2xx` response is success. Anything else — a non-2xx status, a timeout, or a transport error — is retried, six times over roughly nineteen minutes, and then given up on.
 
