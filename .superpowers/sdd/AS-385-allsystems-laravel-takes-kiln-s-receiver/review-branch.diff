@@ -1,0 +1,3635 @@
+Release note:
+Audience: internal
+Reliability: apps using this package now get a scheduled-maintenance page that turns itself off after a set time, answers API callers in their own format, keeps the health check reachable, and no longer reads the database on every request while no maintenance is running.
+
+Commits:
+224d5a9 AS-385: ledger chunk 3
+7319aec AS-385: PlatformMaintenanceMiddleware, bundled 503 page and docs
+564ddad AS-385: ledger chunk 2
+9067ba6 AS-385: signed webhook drives the platform maintenance window
+40b6526 AS-385: ledger chunk 1
+9bae71b AS-385: PlatformMaintenance window, system clock and config keys
+c8302db plan: AS-385-allsystems-laravel-takes-kiln-s-receiver
+
+ CHANGELOG.md                                       |  22 +-
+ CLAUDE.md                                          |   2 +-
+ README.md                                          |  37 +-
+ composer.json                                      |  11 +-
+ config/allsystems.php                              |  53 ++-
+ ...385-allsystems-laravel-takes-kiln-s-receiver.md | 150 ++++++++
+ docs/webhook-contract.md                           |  89 ++---
+ resources/views/maintenance.blade.php              |  20 ++
+ routes/webhook.php                                 |  10 +-
+ src/AllSystemsServiceProvider.php                  |  33 +-
+ src/Events/MaintenanceEnded.php                    |  16 -
+ src/Events/MaintenanceStarted.php                  |  16 -
+ src/Events/PingReceived.php                        |  15 -
+ src/Http/Controllers/WebhookController.php         |  85 ++---
+ .../Middleware/PlatformMaintenanceMiddleware.php   |  80 +++++
+ src/Http/Middleware/VerifySignature.php            |  95 ++---
+ src/Listeners/SyncMaintenanceMode.php              | 132 -------
+ src/MaintenancePayload.php                         | 109 ------
+ src/PlatformMaintenance.php                        | 127 +++++++
+ src/SyncResult.php                                 |  15 -
+ src/SystemClock.php                                |  16 +
+ tests/Doubles/FakeMaintenanceMode.php              |  55 ---
+ tests/Doubles/MockClockProvider.php                |  17 +
+ tests/MaintenancePayloadTest.php                   | 170 ---------
+ tests/PlatformMaintenanceMiddlewareTest.php        | 172 +++++++++
+ tests/PlatformMaintenanceTest.php                  | 151 ++++++++
+ tests/ServiceProviderTest.php                      |  59 ++-
+ tests/SyncMaintenanceModeTest.php                  | 395 ---------------------
+ tests/TestCase.php                                 |  18 +
+ tests/VerifySignatureTest.php                      |  34 +-
+ tests/WebhookControllerTest.php                    | 243 -------------
+ tests/WebhookTest.php                              | 269 ++++++++++++++
+ tests/views/custom-outage.blade.php                |   1 +
+ tests/views/maintenance-window.blade.php           |   2 -
+ 34 files changed, 1268 insertions(+), 1451 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ef0b6e0..267cabe 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,16 +1,14 @@
+ # Changelog
+ 
+ All notable changes to `allsystems/laravel` are documented here.
+ 
+-## Unreleased
+-
+-Initial feature set:
+-
+-- Service provider registering `POST {config path}` (default `allsystems/webhook`) with no CSRF, no session and no auth middleware — the HMAC signature is the authentication.
+-- `VerifySignature` middleware: parses the `t=<unix>,v1=<hex>` signature header, enforces a 300-second replay tolerance, and compares digests with `hash_equals()`.
+-- `config/allsystems.php`: `secret`, `path`, `tolerance`, and a `maintenance.*` block (`enabled`, `secret`, `template`, `redirect`, `refresh`) that maps straight onto Laravel's own maintenance-mode options.
+-- `MaintenanceStarted`, `MaintenanceEnded` and `PingReceived` events, dispatched from a single webhook controller that returns `{ ok, action }` for any request it understands and a `noop` `200` for anything it does not.
+-- `SyncMaintenanceMode` listener, registered by default: activates Laravel's `MaintenanceMode` on `maintenance.started` and deactivates it on `maintenance.ended` — but only when the currently-active maintenance mode carries the id of the window being ended, so a hand-run `artisan down` or a different window's maintenance is never lifted by AllSystems.
+-- Automatic exemption of the configured webhook path from `PreventRequestsDuringMaintenance`, so the `maintenance.ended` webhook that is supposed to lift maintenance mode is never itself blocked by it.
+-- CI matrix across PHP 8.2–8.4 and Laravel 12–13 (5 cells; PHP 8.2 × Laravel 13 excluded — `orchestra/testbench` ^11 requires PHP ≥ 8.3). Laravel 11 was dropped from the supported range: every `laravel/framework` 11.x release is permanently blocked by Composer's default security-advisory check (no fix was ever backported to the EOL 11.x line), so `orchestra/testbench ^9.0` could never resolve — see README's Requirements section.
+-- README documenting the full webhook contract, including a golden HMAC test vector, for non-Laravel receivers.
++## v0.1.0
++
++- Signed webhook at `POST {allsystems.path}` (default `webhooks/allsystems`, optionally restricted to `allsystems.domain`) with no CSRF, session or auth middleware: the HMAC signature is the authentication.
++- `VerifySignature` middleware: parses `t=<unix>,v1=<hex>`, enforces a 300-second replay tolerance and compares digests with `hash_equals()`; failures answer `401 {"error":"Invalid signature"}`.
++- `PlatformMaintenance`: the maintenance window is a flag in the default cache store keyed by window id, expiring after `allsystems.max_minutes`, so no database is touched. Webhook answers are `{"action":"activated|deactivated|noop|ignored"}`.
++- `PlatformMaintenanceMiddleware` for the global stack: 503 with `Retry-After` and `Cache-Control: no-store` while a window is open, a JSON:API body for JSON requests, and a bundled self-contained page (`allsystems::maintenance`) for HTML. Exempts `up`, the webhook path and `allsystems.except`.
++- The webhook path is exempted from Laravel's `PreventRequestsDuringMaintenance`, so `ended` still lands after a hand-run `artisan down`.
++- `config/allsystems.php`: `secret`, `path`, `domain`, `tolerance`, `cache_key`, `max_minutes`, `retry_after`, `except`, `view`, `json_detail`.
++- CI matrix across PHP 8.2-8.4 and Laravel 12-13 (5 cells; PHP 8.2 x Laravel 13 excluded because `orchestra/testbench` ^11 requires PHP 8.3 or later). Laravel 11 is unsupported: every `laravel/framework` 11.x release is blocked by Composer's default security-advisory check.
++- README and `docs/webhook-contract.md` document the contract, including a golden HMAC test vector for non-Laravel receivers.
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 707d3bb..a3a69d3 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -1,13 +1,13 @@
+ # allsystems-live/laravel
+ 
+-Composer package: signed AllSystems maintenance webhooks driving Laravel's own maintenance mode. No deploy.
++Composer package: signed AllSystems maintenance webhooks opening a cache-flag maintenance window that a global middleware turns into 503s. No deploy.
+ 
+ ## Commands
+ 
+ ```bash
+ composer install
+ composer test        # vendor/bin/phpunit
+ composer check        # pint --test, phpstan analyse, phpunit — all green before any PR
+ ```
+ 
+ ## Branch and PR rules
+diff --git a/README.md b/README.md
+index ff0896d..26a07d9 100644
+--- a/README.md
++++ b/README.md
+@@ -1,40 +1,58 @@
+ <img width="100%" src="assets/readme-header.svg">
+ 
+ <h1 align="center">laravel</h1>
+ 
+-<p align="center"><i>Composer package: receives signed AllSystems maintenance webhooks and drives Laravel's own maintenance mode.</i></p>
++<p align="center"><i>Composer package: receives signed AllSystems maintenance webhooks and answers 503 while a platform maintenance window is open.</i></p>
+ 
+ ## What it is
+ 
+ A tenant schedules a maintenance window in AllSystems.
+ AllSystems posts a signed webhook when the window starts and when it ends.
+-This package verifies the signature and activates/deactivates Laravel's maintenance mode via `Illuminate\Contracts\Foundation\MaintenanceMode`, never `artisan down`.
++This package verifies the signature and opens or closes a maintenance window: a flag kept in the app's default cache store, so every instance agrees on it without touching the database a release may be migrating.
++The window expires by itself after `allsystems.max_minutes` (30 by default), so a lost `ended` webhook cannot keep the app down.
++While it is open, `PlatformMaintenanceMiddleware` answers every request with a 503, `Retry-After` and `Cache-Control: no-store`, except `up` and the webhook path, which must stay reachable so `ended` can land.
++It never uses Laravel's own `artisan down` mode.
+ 
+ | Fact | Value |
+ |---|---|
+ | Language / runtime | PHP ^8.2 (CI matrix: 8.2, 8.3, 8.4) |
+ | Framework | Laravel / Illuminate ^12.0 \|\| ^13.0 (Laravel 11 unsupported, see below) |
+ | Hosting | None — Composer package, no deployed service |
+ | AWS account | None |
+ | Primary domain(s) | None |
+ | GitHub org/repo | `allsystems-live/laravel` |
+ | Default branch | `main` |
+ 
+ Laravel 11 is dropped: every `laravel/framework` 11.x release is flagged by an unpatched security advisory (11.x is EOL), so Composer's advisory block refuses to resolve it. See `.github/workflows/ci.yml`.
+ 
+ ## Where it fits
+ 
+-- Requires `illuminate/config`, `illuminate/contracts`, `illuminate/http`, `illuminate/routing`, `illuminate/support` (`^12.0 || ^13.0`) — see `composer.json`.
++- Requires `illuminate/cache`, `illuminate/config`, `illuminate/contracts`, `illuminate/http`, `illuminate/routing`, `illuminate/support`, `illuminate/view` (`^12.0 || ^13.0`) — see `composer.json`.
+ - Counterparty service: [AllSystems](https://github.com/allsystems-live) sends the signed `maintenance.started` / `maintenance.ended` / `ping` webhooks this package verifies and consumes.
+ - Consumed by any Laravel application that installs `allsystems/laravel` via Composer; consuming applications are not tracked in this repo.
+ 
++## Install
++
++Add the repository, then require the package:
++
++```bash
++composer config repositories.allsystems vcs https://github.com/allsystems-live/laravel
++composer require allsystems/laravel:^0.1.0
++```
++
++Add `\AllSystems\Laravel\Http\Middleware\PlatformMaintenanceMiddleware::class` to the global middleware, after `HandleCors`: after it so browser callers can read the 503, and before any database work.
++
++The default cache store must be shared across instances (DynamoDB or Redis on Lambda), never `array` or `file`, or instances will disagree about the window.
++
++Set `ALLSYSTEMS_WEBHOOK_SECRET` to the secret shown on the application's page in AllSystems, and register `https://your-app.example/webhooks/allsystems` there as the webhook URL.
++
+ ## Run it
+ 
+ Prerequisites: PHP 8.2–8.4, Composer.
+ 
+ ```bash
+ composer install
+ ```
+ 
+ Run the tests:
+ 
+@@ -47,28 +65,37 @@ Quality gates, all green before any PR (`composer check` runs all three):
+ ```bash
+ vendor/bin/pint --test
+ vendor/bin/phpstan analyse --memory-limit=512M
+ vendor/bin/phpunit
+ ```
+ 
+ ## How it ships
+ 
+ No deploy: this is a public Composer package with no infrastructure stack, artifact key or dispatch payload.
+ Merge to `main` triggers CI only (`.github/workflows/ci.yml`, the matrix above).
++Releases are cut by Josh with release-train: plan the release candidate, then cut it, then promote it.
++
++```bash
++gh release-train rc -R allsystems-live/laravel minor --plan-only
++gh release-train rc -R allsystems-live/laravel minor
++gh release-train promote -R allsystems-live/laravel
++```
++
+ Branch and PR rules are in `CLAUDE.md`.
+ 
+ ## Layout
+ 
+ | Path | Purpose |
+ |---|---|
+-| `src/` | Service provider, HTTP controller/middleware, events, listener, payload/result value objects |
++| `src/` | Service provider, `PlatformMaintenance` window, system clock, webhook controller, `VerifySignature` and `PlatformMaintenanceMiddleware` |
+ | `config/` | `config/allsystems.php` — the only config file |
++| `resources/views/` | `maintenance.blade.php` — the bundled 503 page |
+ | `routes/` | `routes/webhook.php` — the webhook route |
+ | `tests/` | PHPUnit tests, flat (no `plugins/*/tests` split) |
+ | `assets/` | README banner |
+ 
+ ## Rules and docs
+ 
+ - Rules: `CLAUDE.md`.
+-- Full webhook contract, config reference, events and golden HMAC test vector: `docs/webhook-contract.md`.
++- Full webhook contract, the maintenance window, config reference and golden HMAC test vector: `docs/webhook-contract.md`.
+ - Specs: `docs/superpowers/specs/{proposed,active,done}` (not present in this repo yet; the estate convention).
+ - Plans: `docs/superpowers/plans` (not present in this repo yet; the estate convention).
+diff --git a/composer.json b/composer.json
+index e283305..dded678 100644
+--- a/composer.json
++++ b/composer.json
+@@ -1,29 +1,34 @@
+ {
+     "name": "allsystems/laravel",
+-    "description": "Receive AllSystems maintenance webhooks and drive Laravel's maintenance mode automatically.",
++    "description": "Receive AllSystems maintenance webhooks and hold a shared-cache maintenance window and answer 503 while it is open.",
+     "keywords": ["laravel", "maintenance-mode", "status-page", "webhook", "allsystems"],
+     "homepage": "https://github.com/allsystems-live/laravel",
+     "license": "MIT",
+     "require": {
+         "php": "^8.2",
+         "illuminate/config": "^12.0 || ^13.0",
++        "illuminate/cache": "^12.0 || ^13.0",
+         "illuminate/contracts": "^12.0 || ^13.0",
+         "illuminate/http": "^12.0 || ^13.0",
+         "illuminate/routing": "^12.0 || ^13.0",
+-        "illuminate/support": "^12.0 || ^13.0"
++        "illuminate/support": "^12.0 || ^13.0",
++        "illuminate/view": "^12.0 || ^13.0",
++        "psr/clock": "^1.0",
++        "psr/log": "^3.0"
+     },
+     "require-dev": {
+         "laravel/pint": "^1.27",
+         "orchestra/testbench": "^10.0 || ^11.0",
+         "phpstan/phpstan": "^2.1",
+-        "phpunit/phpunit": "^11.0 || ^12.0"
++        "phpunit/phpunit": "^11.0 || ^12.0",
++        "symfony/clock": "^7.0"
+     },
+     "autoload": {
+         "psr-4": {
+             "AllSystems\\Laravel\\": "src/"
+         }
+     },
+     "autoload-dev": {
+         "psr-4": {
+             "AllSystems\\Laravel\\Tests\\": "tests/"
+         }
+diff --git a/config/allsystems.php b/config/allsystems.php
+index a82c58c..56d3c58 100644
+--- a/config/allsystems.php
++++ b/config/allsystems.php
+@@ -8,50 +8,43 @@ return [
+      * page in AllSystems admin, where it is shown once at creation and once
+      * per regeneration.
+      */
+     'secret' => env('ALLSYSTEMS_WEBHOOK_SECRET'),
+ 
+     /*
+      * The path the webhook is served at, relative to your app root and with no
+      * leading slash. Change it if it collides with something; AllSystems only
+      * needs the full URL you register there.
+      */
+-    'path' => env('ALLSYSTEMS_WEBHOOK_PATH', 'allsystems/webhook'),
++    'path' => env('ALLSYSTEMS_WEBHOOK_PATH', 'webhooks/allsystems'),
++
++    /*
++     * Restricts the webhook route to this host. Null serves it on every host.
++     */
++    'domain' => env('ALLSYSTEMS_WEBHOOK_DOMAIN'),
+ 
+     /*
+      * How far the signature timestamp may be from now, in seconds, before the
+      * request is rejected as a replay. AllSystems retries for ~19 minutes, so
+      * a value below the default trades replay protection for lost deliveries
+      * on a clock-skewed host.
+      */
+     'tolerance' => (int) env('ALLSYSTEMS_WEBHOOK_TOLERANCE', 300),
+ 
+-    'maintenance' => [
+-        /*
+-         * Whether the bundled SyncMaintenanceMode listener is registered. Set
+-         * false to receive the events and do your own thing with them; the
+-         * webhook still verifies and still dispatches.
+-         */
+-        'enabled' => (bool) env('ALLSYSTEMS_MAINTENANCE_ENABLED', true),
+-
+-        /*
+-         * Everything below is your app's own maintenance-mode configuration,
+-         * passed straight through to Laravel. AllSystems never sends any of it
+-         * and never sees it.
+-         */
+-
+-        // Bypass phrase: visiting /{secret} sets a cookie that lets you through.
+-        'secret' => env('ALLSYSTEMS_MAINTENANCE_BYPASS_SECRET'),
+-
+-        // A view name, rendered when the window opens and served as the
+-        // maintenance page. Equivalent to `artisan down --render=`.
+-        'template' => env('ALLSYSTEMS_MAINTENANCE_TEMPLATE'),
+-
+-        // A path to redirect all traffic to. Equivalent to `--redirect=`.
+-        'redirect' => env('ALLSYSTEMS_MAINTENANCE_REDIRECT'),
+-
+-        // Seconds for the Refresh header. Equivalent to `--refresh=`.
+-        'refresh' => env('ALLSYSTEMS_MAINTENANCE_REFRESH') === null
+-            ? null
+-            : (int) env('ALLSYSTEMS_MAINTENANCE_REFRESH'),
+-    ],
++    // Where the maintenance window is kept, in the default cache store.
++    'cache_key' => 'allsystems:platform-maintenance',
++
++    // Safety expiry in minutes, so a lost `ended` webhook cannot keep the app down.
++    'max_minutes' => (int) env('ALLSYSTEMS_MAINTENANCE_MAX_MINUTES', 30),
++
++    // Seconds sent in the Retry-After header of the 503.
++    'retry_after' => 60,
++
++    // Paths the gate lets through during a window, besides the webhook; `up` keeps deploy smoke checks green.
++    'except' => ['up'],
++
++    // The view served as the 503 page for HTML requests.
++    'view' => 'allsystems::maintenance',
++
++    // The `detail` of the JSON:API 503 body.
++    'json_detail' => "We're doing some scheduled maintenance. Please try again in a minute or two.",
+ ];
+diff --git a/docs/superpowers/plans/AS-385-allsystems-laravel-takes-kiln-s-receiver.md b/docs/superpowers/plans/AS-385-allsystems-laravel-takes-kiln-s-receiver.md
+new file mode 100644
+index 0000000..e48205d
+--- /dev/null
++++ b/docs/superpowers/plans/AS-385-allsystems-laravel-takes-kiln-s-receiver.md
+@@ -0,0 +1,150 @@
++# AS-385: allsystems/laravel takes Kiln's receiver; v0.1.0
++Ticket: AS-385 @ 2026-11-23T20:08:01.653+0000
++
++## Global Constraints
++
++- All gates green after every chunk, run from the orchestrator root: `bash scripts/run-gates.sh --repo laravel AS-385-allsystems-laravel-takes-kiln-s-receiver` (pint-test, analyse at phpstan level 9 over src and tests, phpunit). Use `--only pint` / `--only test` while iterating. CI must hold on all 5 matrix cells (PHP 8.2–8.4 × Laravel 12–13), so no PHP 8.3-only syntax: class constants are untyped (`private const KEY = ...`, never `private const string`).
++- No weakened invariant: the HMAC check stays hash_equals over the raw body, fail-closed on an empty secret; no test is deleted except those the ticket lists for deletion; no auto-merge.
++- The package never registers PlatformMaintenanceMiddleware itself; the app adds it after HandleCors.
++- The window lives only in `$cache->store()` under `allsystems.cache_key`; nothing reads or writes Laravel's MaintenanceMode or `app.maintenance.store`.
++- The ported source is Kiln at origin/main, under `application/` (the ticket's paths omit that prefix): `application/app/Miscellaneous/Services/PlatformMaintenance.php`, `application/app/Miscellaneous/Http/Middleware/{PlatformMaintenanceMiddleware,VerifyAllSystemsSignature}.php`, `application/app/Miscellaneous/Http/Controllers/AllSystemsWebhookController.php`, and tests `application/tests/Unit/Miscellaneous/Services/PlatformMaintenanceTest.php`, `application/tests/Feature/Miscellaneous/Http/{PlatformMaintenanceTest,AllSystemsWebhookTest}.php`. Read them with `git -C ~/dev/agent-farm/kiln show origin/main:<path>`. Kiln's config keys (`app.maintenance.max_minutes`, `services.allsystems.webhook_secret`, `services.allsystems.tolerance`) become `allsystems.max_minutes`, `allsystems.secret`, `allsystems.tolerance`.
++- The webhook path default changes from `allsystems/webhook` to `webhooks/allsystems`. Grep the whole tree (src, routes, config, tests, README, docs, CLAUDE.md) for `allsystems/webhook` and update every occurrence, including the provider's fallback literal and test `PATH` constants.
++- Not touched: `.github/` (CI matrix and php.json), `phpunit.xml`, `phpstan.neon`, `pint.json`, `tests/SkeletonTest.php`. No `version` field in composer.json, no Packagist, no release-train group. The release (`gh release-train rc/promote`) is post-merge and Josh-run: not part of this build.
++- Out of scope: vehicle-lookup notice, storefront purge, SPA notice, admin bypass, Laravel 11.
++- Project skills: none
++
++## Chunk 1: The window, the clock and the new config keys
++
++Files:
++- Create: src/PlatformMaintenance.php
++- Create: src/SystemClock.php
++- Modify: src/AllSystemsServiceProvider.php
++- Modify: config/allsystems.php
++- Modify: composer.json
++- Test: tests/PlatformMaintenanceTest.php
++- Test: tests/ServiceProviderTest.php
++
++Interfaces: hands later chunks `AllSystems\Laravel\PlatformMaintenance` with `start(string $id): string` ('activated'|'noop'), `end(string $id): string` ('deactivated'|'noop'), `isActive(): bool`; `AllSystems\Laravel\SystemClock`; `Psr\Clock\ClockInterface` bound via `bindIf`; config keys `allsystems.cache_key` and `allsystems.max_minutes`.
++
++Behaviour:
++- PlatformMaintenance is Kiln's PlatformMaintenance.php ported verbatim except: namespace `AllSystems\Laravel`; drop RETRY_AFTER_SECONDS (retry_after is config in chunk 3); KEY constant replaced by reading `allsystems.cache_key` from config; maxMinutes reads `allsystems.max_minutes`; constants untyped. Constructor (CacheFactory, ConfigRepository, ClockInterface, LoggerInterface), state `{id, started_at, expires_at}` via `forever()`, logs `platform_maintenance.started|ended` (info, `['id']`) and `platform_maintenance.expired` (warning, `id` + `started_at` as DATE_ATOM) unchanged. The cache key read must be a string for phpstan level 9 (cast or narrow with a fallback to the default).
++- SystemClock: `final class SystemClock implements ClockInterface`, `now(): DateTimeImmutable { return new DateTimeImmutable(); }`.
++- Provider register(): add `$this->app->bindIf(ClockInterface::class, SystemClock::class)`. Leave the SyncResult binding, listener and `maintenance.*` handling alone in this chunk (removed in chunk 2) so the old suite stays green.
++- config/allsystems.php: add flat top-level keys `cache_key => 'allsystems:platform-maintenance'` and `max_minutes => (int) env('ALLSYSTEMS_MAINTENANCE_MAX_MINUTES', 30)`, each with a one-line comment. Leave the `maintenance` array for now.
++- composer.json require: add `illuminate/cache` and `illuminate/view` (`^12.0 || ^13.0`), `psr/clock: ^1.0`, `psr/log: ^3.0`; require-dev: `symfony/clock: ^7.0`. Keep sort-packages order. The repo tracks no composer.lock; run `composer update` locally so vendor resolves.
++
++Test scenarios (tests/PlatformMaintenanceTest.php, Kiln's 11 unit cases with a MockClock bound as `ClockInterface` and `Log::spy()`): inactive by default; start activates; same id is a noop and keeps the original expires_at; a different id replaces and answers activated; end with the active id deactivates; end with another id is a noop and the window stays; end while inactive is a noop; after max_minutes isActive() is false, forgets the key and logs exactly one `platform_maintenance.expired` warning; max_minutes comes from `allsystems.max_minutes`; the flag lives in the default store under `allsystems:platform-maintenance`; `app.maintenance.store = database` is ignored (window still works, nothing in the database store).
++ServiceProviderTest additions: ClockInterface resolves to SystemClock when unbound; an app binding of ClockInterface made before the provider registers (bind in `defineEnvironment` / a test-specific provider) wins.
++
++ACs met: window stored under allsystems.cache_key in `$cache->store()`, never MaintenanceMode; start/noop/replace semantics; end/noop semantics; expiry after max_minutes with the single expired warning; start/end info logs.
++
++## Chunk 2: The signed webhook
++
++Files:
++- Modify: src/Http/Middleware/VerifySignature.php
++- Modify: src/Http/Controllers/WebhookController.php
++- Modify: routes/webhook.php
++- Modify: src/AllSystemsServiceProvider.php
++- Modify: config/allsystems.php
++- Delete: src/Listeners/SyncMaintenanceMode.php
++- Delete: src/SyncResult.php
++- Delete: src/MaintenancePayload.php
++- Delete: src/Events/MaintenanceStarted.php
++- Delete: src/Events/MaintenanceEnded.php
++- Delete: src/Events/PingReceived.php
++- Delete: tests/SyncMaintenanceModeTest.php
++- Delete: tests/MaintenancePayloadTest.php
++- Delete: tests/WebhookControllerTest.php
++- Delete: tests/Doubles/FakeMaintenanceMode.php
++- Delete: tests/views/maintenance-window.blade.php
++- Test: tests/WebhookTest.php
++- Test: tests/VerifySignatureTest.php
++- Test: tests/ServiceProviderTest.php
++- Test: tests/TestCase.php
++
++Interfaces: consumes PlatformMaintenance and ClockInterface from chunk 1. Hands chunk 3 the final flat config (adds `path`, `domain`) and a provider with `loadViewsFrom` still to add.
++
++Behaviour:
++- VerifySignature: body replaced with Kiln's VerifyAllSystemsSignature.php (handle, parse, reject). Keep the class name `VerifySignature` and `public const HEADER = 'X-AllSystems-Signature'`. Constructor (ConfigRepository, ClockInterface, LoggerInterface); secret from `allsystems.secret`, tolerance from `allsystems.tolerance`; a non-string or empty secret rejects `secret_unset`. reject() logs warning `allsystems.webhook_rejected` with only `['reason' => ...]` and answers 401 `{"error":"Invalid signature"}`. Make the class `final` (not readonly, or readonly with promoted readonly props; either passes on 8.2). phpstan level 9: `(string) $config->get(...)` on mixed is an error, so narrow with `is_string` / `is_numeric` as the current file does.
++- WebhookController: Kiln's controller :33-67 and `answer()` :125-128 without the vehicle-lookup branch, VehicleLookupNotice, startNotice, isVehicleLookupWindow, parseTime. Constructor takes only PlatformMaintenance. Decode `getContent()`; not an array or no string `event` → 400 `{"error":"Invalid payload"}`; `ping` → noop; anything other than maintenance.started / maintenance.ended → ignored; `id` not a non-empty string → 400; ended → `end($id)`; started → `start($id)`. Every answer `new JsonResponse(['action' => $a], 200)`. The X-AllSystems-Event header is never read. A JSON list body (`[]`) decodes to an array without `event`, so it is a 400.
++- routes/webhook.php: the route as today, wrapped in `Route::domain($domain)->group(...)` when `config('allsystems.domain')` is a non-empty string; otherwise unwrapped. Keep the "deliberately naked" comment.
++- Provider: remove the SyncResult binding, the listener registration, the `allsystems.maintenance.enabled` read and the now-unused imports (Dispatcher, events, listener); boot() no longer takes Dispatcher. Path fallback literal becomes `webhooks/allsystems`. Keep the path normalisation and `PreventRequestsDuringMaintenance::except([$path])` with its comment updated (the gate is now PlatformMaintenanceMiddleware; the exemption remains for a hand-run `artisan down`).
++- config/allsystems.php: remove the `maintenance` array; `path` default becomes `webhooks/allsystems`; add `domain => env('ALLSYSTEMS_WEBHOOK_DOMAIN')` (null means every host). Keep `secret` and `tolerance`.
++- TestCase: bind a `Symfony\Component\Clock\MockClock` as `ClockInterface` (fixed instant) in defineEnvironment so signing tests use `$clock->now()->getTimestamp()` rather than `time()`; expose it to subclasses.
++
++Test scenarios:
++- tests/WebhookTest.php (Kiln AllSystemsWebhookTest.php :35-45 and :144-294, generic only): started opens the window and a redelivery answers noop; ended for the open window deactivates; ended for another window is noop and the window stays; the event comes from the body (header says ended, body says started → activated); rejected signatures as a data provider (missing header, malformed header, wrong secret, tampered body, stale and future timestamp) each 401 `{"error":"Invalid signature"}` and leave the window untouched; an unset or empty secret 401s even a valid signature; the tolerance edge (now−300 passes, now−301 fails); ping answers noop; an unknown event answers ignored; invalid bodies as a data provider (not JSON, a JSON scalar, a list, no event, non-string event, started without id, ended with empty id) answer 400 `{"error":"Invalid payload"}`; the golden delivery (vector 1 body with `t=1787000000` and the MockClock at that instant) answers activated.
++- WebhookTest also: a 401 logs exactly one `allsystems.webhook_rejected` warning whose context is only `['reason' => <reason>]` (assert each of the four reasons); with `allsystems.domain = 'hooks.example.test'` the signed POST to `http://hooks.example.test/webhooks/allsystems` answers 200 and the same POST to another host answers 404.
++- tests/VerifySignatureTest.php: kept; `PATH` becomes `/webhooks/allsystems`; `time()` replaced by the MockClock; rejection assertions expect `{"error":"Invalid signature"}`; the success cases use a body with `"event":"ping"` (already so) so 200 still holds.
++- tests/ServiceProviderTest.php: drop listener and `maintenance.enabled` assertions; config-defaults test asserts `path` `webhooks/allsystems`, `tolerance` 300, `cache_key`, `max_minutes` 30, `retry_after`/`except`/`view`/`json_detail` arrive in chunk 3; path override, empty/wildcard fallback and exactly-one-exemption cases kept with the new default path, and their signed requests use a ping body (`[]` now answers 400); the `artisan down` exemption case still proves the webhook answers while Laravel's MaintenanceMode is active and `/` 503s.
++- tests/SignatureVectorsTest.php: unchanged (it never calls `time()`); confirm it still passes.
++
++ACs met: signed POST on path/domain with tolerance; 401 cases, logging and empty-secret rule; event from the body and 400 payload rules; started/ended/ping/ignored answers; webhook path still in PreventRequestsDuringMaintenance::except().
++
++## Chunk 3: The gate, the page and the docs
++
++Files:
++- Create: src/Http/Middleware/PlatformMaintenanceMiddleware.php
++- Create: resources/views/maintenance.blade.php
++- Modify: src/AllSystemsServiceProvider.php
++- Modify: config/allsystems.php
++- Modify: composer.json
++- Modify: README.md
++- Modify: docs/webhook-contract.md
++- Modify: CHANGELOG.md
++- Modify: CLAUDE.md
++- Test: tests/PlatformMaintenanceMiddlewareTest.php
++- Test: tests/ServiceProviderTest.php
++
++Interfaces: consumes PlatformMaintenance (chunk 1) and the final path config (chunk 2). Hands the app `AllSystems\Laravel\Http\Middleware\PlatformMaintenanceMiddleware` and view namespace `allsystems`.
++
++Behaviour:
++- PlatformMaintenanceMiddleware: Kiln's PlatformMaintenanceMiddleware.php, `final`, constructor (PlatformMaintenance, ResponseFactory, ConfigRepository). Exempt list is `[config('allsystems.path'), ...config('allsystems.except')]`, filtered to strings for phpstan, matched with `$request->is(...)`, checked before `isActive()` so exempt paths never read the cache. When active: headers `Retry-After` (string of `allsystems.retry_after`) and `Cache-Control: no-store`; `expectsJson()` gets the JSON:API body with `detail` from `allsystems.json_detail` and `Content-Type: application/vnd.api+json`; otherwise `view(config('allsystems.view'), [], 503, $headers)`. No DB access anywhere on the path.
++- resources/views/maintenance.blade.php: the Earnly view below with both "Earnly" replaced by `{{ config('app.name') }}`.
++- Provider boot(): `$this->loadViewsFrom(__DIR__ . '/../resources/views', 'allsystems')`.
++- config/allsystems.php: add `retry_after => 60`, `except => ['up']`, `view => 'allsystems::maintenance'`, `json_detail => "We're doing some scheduled maintenance. Please try again in a minute or two."`, each with a one-line comment. Final key set is exactly the ticket's ten flat keys.
++- composer.json `description`: replace "drive Laravel's maintenance mode automatically" with wording for the cache-flag window (no infra vendor names needed).
++- README.md: "What it is" describes the cache-flag window, its expiry and the gate; new "Install" section (VCS repository entry for `https://github.com/allsystems-live/laravel`, `composer require allsystems/laravel:^0.1.0`, add `\AllSystems\Laravel\Http\Middleware\PlatformMaintenanceMiddleware::class` to global middleware after HandleCors and why: after CORS so browser callers read the 503, before any database work; the default cache store must be shared across instances, DynamoDB or Redis on Lambda, never array or file; `ALLSYSTEMS_WEBHOOK_SECRET`); "How it ships" gains the two release-train commands verbatim from the ticket (`gh release-train rc -R allsystems-live/laravel minor --plan-only`, then without `--plan-only`; `gh release-train promote -R allsystems-live/laravel`), Josh-run. Update Layout for the new/removed files. Keep the estate README standard's section order.
++- docs/webhook-contract.md: replace "Maintenance drivers", "Events" and "The id guard" with one "The window" section (cache key, default store, max_minutes expiry and its warning, id semantics, exemptions `up` + webhook path + `except`); Configuration lists the ten flat keys; response bodies become `{"action":…}` (activated, deactivated, noop, ignored) and `{"error":"Invalid signature"}` / `{"error":"Invalid payload"}`; default path `webhooks/allsystems`. Keep "Golden test vector" unchanged.
++- CHANGELOG.md: rename `## Unreleased` to `## v0.1.0` and rewrite its entries for this implementation.
++- CLAUDE.md: its one-line description says the package drives Laravel's own maintenance mode; change it to the cache-flag window.
++
++The view to port (Earnly PR #58, getearnly-io/earnly branch build/EARN-203-earnly-receives-allsystems-maintenance-w, `application/resources/views/errors/platform-maintenance.blade.php`):
++
++    <!doctype html>
++    <html lang="en">
++    <head>
++        <meta charset="utf-8">
++        <meta name="viewport" content="width=device-width, initial-scale=1">
++        <title>Earnly – back in a minute</title>
++        <style>
++            body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; font-family: system-ui, sans-serif; background: #f8fafc; color: #0f172a; text-align: center; }
++            main { padding: 24px; }
++            h1 { font-size: 1.75rem; margin: 0 0 12px; }
++            p { margin: 0; color: #475569; }
++        </style>
++    </head>
++    <body>
++        <main>
++            <h1>We're updating Earnly</h1>
++            <p>We'll be back in a minute. Please try again shortly.</p>
++        </main>
++    </body>
++    </html>
++
++Test scenarios (tests/PlatformMaintenanceMiddlewareTest.php, Kiln's feature PlatformMaintenanceTest made generic; push the middleware onto the kernel's global stack and register throwaway GET `/` and POST `/other` routes in the test):
++- an open window answers `/` with 503, `Retry-After: 60`, `Cache-Control: no-store`, and the HTML page containing `<title>{app.name} – back in a minute</title>`, `We're updating {app.name}` and the "We'll be back in a minute" text, with no asset URL;
++- a JSON request gets 503 with `application/vnd.api+json` and the exact JSON:API body including `code: platform_maintenance` and the default detail;
++- `up` and a signed `maintenance.ended` to the webhook path are not answered by the gate (the ended closes the window);
++- POST `/other` gets the 503;
++- an extra `allsystems.except` path passes;
++- with no window open nothing is turned away and, with `app.maintenance.store = database`, `DB::listen` records zero queries across the request;
++- a started window still 503s with `app.maintenance.store = database`;
++- `allsystems.retry_after`, `allsystems.json_detail` and `allsystems.view` overrides are honoured (one case each, or one combined).
++ServiceProviderTest: config-defaults test extended to the four new keys; `view()->exists('allsystems::maintenance')` is true.
++
++ACs met: one cache read and no DB query with no window; 503 gate with Retry-After and no-store and exemptions; JSON:API body; bundled self-contained view; composer check green on the matrix (final gate run).
++
++## Notes
++
++- The release (rc then promote to v0.1.0) and the post-release checks are post-merge, Josh-run: no chunk.
+diff --git a/docs/webhook-contract.md b/docs/webhook-contract.md
+index 3a59c2a..1aa5527 100644
+--- a/docs/webhook-contract.md
++++ b/docs/webhook-contract.md
+@@ -1,92 +1,41 @@
+ # Webhook contract and configuration reference
+ 
+-Moved out of README.md during the 2026-09-27 README rewrite to the estate standard; content unchanged, still current.
+-
+ ## Configuration
+ 
+ Every key in `config/allsystems.php`:
+ 
+ | Key | Env var | Default |
+ |---|---|---|
+-| `secret` | `ALLSYSTEMS_WEBHOOK_SECRET` | *(none — required)* |
+-| `path` | `ALLSYSTEMS_WEBHOOK_PATH` | `allsystems/webhook` |
++| `secret` | `ALLSYSTEMS_WEBHOOK_SECRET` | *(none, required)* |
++| `path` | `ALLSYSTEMS_WEBHOOK_PATH` | `webhooks/allsystems` |
++| `domain` | `ALLSYSTEMS_WEBHOOK_DOMAIN` | `null` (every host) |
+ | `tolerance` | `ALLSYSTEMS_WEBHOOK_TOLERANCE` | `300` |
+-| `maintenance.enabled` | `ALLSYSTEMS_MAINTENANCE_ENABLED` | `true` |
+-| `maintenance.secret` | `ALLSYSTEMS_MAINTENANCE_BYPASS_SECRET` | `null` |
+-| `maintenance.template` | `ALLSYSTEMS_MAINTENANCE_TEMPLATE` | `null` |
+-| `maintenance.redirect` | `ALLSYSTEMS_MAINTENANCE_REDIRECT` | `null` |
+-| `maintenance.refresh` | `ALLSYSTEMS_MAINTENANCE_REFRESH` | `null` |
+-
+-`maintenance.secret`, `maintenance.template`, `maintenance.redirect` and `maintenance.refresh` are your app's own maintenance-mode configuration, passed straight through to Laravel's `MaintenanceMode::activate()` — the same options `artisan down --secret= --render= --redirect= --refresh=` accepts. AllSystems never sends any of this and never sees it.
+-
+-Install:
+-
+-```bash
+-composer require allsystems/laravel
+-php artisan vendor:publish --tag=allsystems-config
+-```
+-
+-Set the two env vars that matter:
+-
+-```
+-ALLSYSTEMS_WEBHOOK_SECRET=whsec_...
+-ALLSYSTEMS_WEBHOOK_PATH=allsystems/webhook   # optional, this is the default
+-```
+-
+-Then, in AllSystems, register `https://your-app.example/allsystems/webhook` as the application's webhook URL and press **Send test ping**.
+-
+-## Maintenance drivers
+-
+-This package has no opinion on, and no configuration for, which driver backs Laravel's maintenance mode. That is your app's own `APP_MAINTENANCE_DRIVER` choice — file, cache, or anything else — and it is yours to make. See [Laravel's maintenance-mode documentation](https://laravel.com/docs/configuration#maintenance-mode).
+-
+-One real consequence of driving the contract through `MaintenanceMode::activate()` rather than `artisan down`: the pre-rendered `storage/framework/maintenance.php` short-circuit file is **not** written. Requests still boot the framework — which is precisely what lets the webhook route stay reachable and lets the app come back up when `maintenance.ended` arrives.
++| `cache_key` | | `allsystems:platform-maintenance` |
++| `max_minutes` | `ALLSYSTEMS_MAINTENANCE_MAX_MINUTES` | `30` |
++| `retry_after` | | `60` |
++| `except` | | `['up']` |
++| `view` | | `allsystems::maintenance` |
++| `json_detail` | | `We're doing some scheduled maintenance. Please try again in a minute or two.` |
+ 
+-A leftover `storage/framework/maintenance.php` from an earlier `artisan down` changes how requests are served — delete it or run `artisan up` once before adopting this package.
++Publish the file with `php artisan vendor:publish --tag=allsystems-config`.
+ 
+-## Events
++## The window
+ 
+-Three events are dispatched, always, regardless of `maintenance.enabled`:
++`maintenance.started` opens a window: a flag stored under `cache_key` in the app's default cache store, shared by every instance, so no database is read or written.
++`maintenance.ended` closes it.
++The flag expires after `max_minutes`, so a lost `ended` cannot keep the app down; the package logs a warning when it finds an expired window.
+ 
+-- **`MaintenanceStarted`** — carries a `MaintenancePayload` (`id`, `title`, `message`, `startsAt`, `endsAt`, `components`) built from the `maintenance.started` body.
+-- **`MaintenanceEnded`** — carries the same `MaintenancePayload` shape, built from the `maintenance.ended` body.
+-- **`PingReceived`** — carries `applicationId` and `applicationName`, built from a `ping` body.
++The flag carries the id of the window that opened it. A redelivered `started` for the open window is a no-op and does not extend it, and an `ended` for any other id is a no-op, so another window's delivery never closes this one.
+ 
+-A copy-pasteable listener for an app that wants to pause its own queue workers during a window:
+-
+-```php
+-use AllSystems\Laravel\Events\MaintenanceStarted;
+-use AllSystems\Laravel\Events\MaintenanceEnded;
+-use Illuminate\Support\Facades\Event;
+-
+-Event::listen(MaintenanceStarted::class, function (MaintenanceStarted $event) {
+-    Artisan::call('queue:pause');
+-});
+-
+-Event::listen(MaintenanceEnded::class, function (MaintenanceEnded $event) {
+-    Artisan::call('queue:resume');
+-});
+-```
+-
+-Set `ALLSYSTEMS_MAINTENANCE_ENABLED=false` for apps that want these events without the package's default `SyncMaintenanceMode` behaviour — the webhook still verifies and still dispatches, only the bundled listener is not registered.
+-
+-## The id guard
+-
+-An `artisan down` you ran by hand is never lifted by AllSystems, and neither is another window's. `SyncMaintenanceMode` only calls `deactivate()` when the currently-active maintenance mode carries the id of the window it is being asked to end:
+-
+-```php
+-final readonly class SyncMaintenanceMode
+-{
+-    /** The marker that makes a maintenance mode ours. */
+-    public const ID_KEY = 'allsystems_maintenance_id';
+-}
+-```
++While the window is open, `PlatformMaintenanceMiddleware` answers every request with a 503, `Retry-After` and `Cache-Control: no-store`: the `view` page for HTML requests, a JSON:API error with code `platform_maintenance` and `json_detail` for requests that expect JSON.
++It exempts `up`, the webhook `path` and every `except` entry; exempt paths never read the cache.
+ 
+ ## The webhook contract
+ 
+ This section is complete enough to implement a receiver in any language, with nothing else to hand.
+ 
+ `POST {your webhook URL}`
+ 
+ Headers:
+ 
+ | Header | Value |
+@@ -123,21 +72,23 @@ Headers:
+   ]
+ }
+ ```
+ 
+ `ping`:
+ 
+ ```json
+ { "event": "ping", "application": { "id": "...", "name": "..." } }
+ ```
+ 
+-**Idempotency.** The key is `(id, event)`. Two documented noop cases: a redelivered `maintenance.started` for a window that is already the active one is a `noop` `200`; a `maintenance.ended` for a window that is not the currently-active one (including "nothing is active") is also a `noop` `200`.
++**Responses.** Every answer is JSON. `200 {"action":"activated"}` and `{"action":"deactivated"}` when the window changed; `{"action":"noop"}` for a redelivered `started`, an `ended` for a window that is not the open one (including "nothing is open") and a `ping`; `{"action":"ignored"}` for an event type this package does not know. `401 {"error":"Invalid signature"}` and `400 {"error":"Invalid payload"}` otherwise.
++
++**Idempotency.** The key is `(id, event)`; see The window for the two noop cases.
+ 
+ **Delivery semantics.** Any `2xx` response is success. Anything else — a non-2xx status, a timeout, or a transport error — is retried, six times over roughly nineteen minutes, and then given up on.
+ 
+ ## Golden test vector
+ 
+ Secret, timestamp and body below are fixed constants — check your own HMAC implementation against them in any language in about five minutes.
+ 
+ ```
+ secret    = whsec_test_31d4a1f7c0b84e6fa9d2c5e8b7043f16
+ timestamp = 1787000000
+diff --git a/resources/views/maintenance.blade.php b/resources/views/maintenance.blade.php
+new file mode 100644
+index 0000000..840c214
+--- /dev/null
++++ b/resources/views/maintenance.blade.php
+@@ -0,0 +1,20 @@
++<!doctype html>
++<html lang="en">
++<head>
++    <meta charset="utf-8">
++    <meta name="viewport" content="width=device-width, initial-scale=1">
++    <title>{{ config('app.name') }} – back in a minute</title>
++    <style>
++        body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; font-family: system-ui, sans-serif; background: #f8fafc; color: #0f172a; text-align: center; }
++        main { padding: 24px; }
++        h1 { font-size: 1.75rem; margin: 0 0 12px; }
++        p { margin: 0; color: #475569; }
++    </style>
++</head>
++<body>
++    <main>
++        <h1>We're updating {{ config('app.name') }}</h1>
++        <p>We'll be back in a minute. Please try again shortly.</p>
++    </main>
++</body>
++</html>
+diff --git a/routes/webhook.php b/routes/webhook.php
+index 737969a..0085cd4 100644
+--- a/routes/webhook.php
++++ b/routes/webhook.php
+@@ -5,14 +5,22 @@ declare(strict_types=1);
+ use AllSystems\Laravel\Http\Controllers\WebhookController;
+ use AllSystems\Laravel\Http\Middleware\VerifySignature;
+ use Illuminate\Support\Facades\Route;
+ 
+ /*
+  * One route, and deliberately naked: no CSRF (there is no session and no form),
+  * no session middleware (the sender is a server, not a browser), no auth guard
+  * (the HMAC signature IS the authentication). VerifySignature is the only thing
+  * standing in front of the controller, and it must stay that way.
+  */
+-Route::post(config('allsystems.path'), WebhookController::class)
++$webhook = static fn () => Route::post(config('allsystems.path'), WebhookController::class)
+     ->middleware(VerifySignature::class)
+     ->name('allsystems.webhook')
+ ;
++
++$domain = config('allsystems.domain');
++
++if (is_string($domain) && $domain !== '') {
++    Route::domain($domain)->group($webhook);
++} else {
++    $webhook();
++}
+diff --git a/src/AllSystemsServiceProvider.php b/src/AllSystemsServiceProvider.php
+index 4eb8821..0c5e7e3 100644
+--- a/src/AllSystemsServiceProvider.php
++++ b/src/AllSystemsServiceProvider.php
+@@ -1,66 +1,53 @@
+ <?php
+ 
+ declare(strict_types=1);
+ 
+ namespace AllSystems\Laravel;
+ 
+-use AllSystems\Laravel\Events\MaintenanceEnded;
+-use AllSystems\Laravel\Events\MaintenanceStarted;
+-use AllSystems\Laravel\Listeners\SyncMaintenanceMode;
+ use Illuminate\Contracts\Config\Repository as ConfigRepository;
+-use Illuminate\Contracts\Events\Dispatcher;
+ use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance;
+ use Illuminate\Support\ServiceProvider;
++use Psr\Clock\ClockInterface;
+ 
+ final class AllSystemsServiceProvider extends ServiceProvider
+ {
+     public function register(): void
+     {
+         $this->mergeConfigFrom(__DIR__ . '/../config/allsystems.php', 'allsystems');
+ 
+-        $this->app->scoped(SyncResult::class);
++        $this->app->bindIf(ClockInterface::class, SystemClock::class);
+     }
+ 
+-    public function boot(ConfigRepository $config, Dispatcher $events): void
++    public function boot(ConfigRepository $config): void
+     {
+         $this->publishes([
+             __DIR__ . '/../config/allsystems.php' => $this->app->configPath('allsystems.php'),
+         ], 'allsystems-config');
+ 
+-        $configuredPath = $config->get('allsystems.path', 'allsystems/webhook');
++        $configuredPath = $config->get('allsystems.path', 'webhooks/allsystems');
+         $path = is_string($configuredPath) ? trim($configuredPath, '/') : '';
+ 
+         if ($path === '' || str_contains($path, '*')) {
+             // Empty (unset, blank .env value, or config:cache without publishing)
+             // or wildcarded (which would hand PreventRequestsDuringMaintenance::except
+             // the whole app) both fall back to the documented default rather than
+             // relocating the route to the site root or exempting everything.
+-            $path = 'allsystems/webhook';
++            $path = 'webhooks/allsystems';
+         }
+ 
+         $config->set('allsystems.path', $path);
+ 
++        $this->loadViewsFrom(__DIR__ . '/../resources/views', 'allsystems');
++
+         $this->loadRoutesFrom(__DIR__ . '/../routes/webhook.php');
+ 
+-        // THE non-obvious one. PreventRequestsDuringMaintenance is in Laravel's
+-        // GLOBAL middleware stack, so once maintenance mode is active every
+-        // request gets a 503 — including the `maintenance.ended` webhook that
+-        // is supposed to lift it. Without this exemption the first window an
+-        // app enters is the last, and it can only be recovered by hand with
+-        // `artisan up`.
+-        //
+-        // Registered unconditionally, even when maintenance.enabled is false:
+-        // an app that handles the events itself is even more likely to be down
+-        // when the `ended` arrives.
++        // PreventRequestsDuringMaintenance is in Laravel's GLOBAL middleware stack, so after a hand-run
++        // `artisan down` the `maintenance.ended` webhook would 503 too. The platform window is gated by
++        // PlatformMaintenanceMiddleware instead, but this exemption keeps the webhook reachable either way.
+         //
+         // One entry: inExceptArray() trims leading/trailing slashes off each
+         // pattern itself, so a second '/'-prefixed variant is redundant and (for
+         // the empty-path case) was actively wrong — it matched the site root.
+         PreventRequestsDuringMaintenance::except([$path]);
+-
+-        if ((bool) $config->get('allsystems.maintenance.enabled', true)) {
+-            $events->listen(MaintenanceStarted::class, [SyncMaintenanceMode::class, 'handleStarted']);
+-            $events->listen(MaintenanceEnded::class, [SyncMaintenanceMode::class, 'handleEnded']);
+-        }
+     }
+ }
+diff --git a/src/Events/MaintenanceEnded.php b/src/Events/MaintenanceEnded.php
+deleted file mode 100644
+index f21ac56..0000000
+--- a/src/Events/MaintenanceEnded.php
++++ /dev/null
+@@ -1,16 +0,0 @@
+-<?php
+-
+-declare(strict_types=1);
+-
+-namespace AllSystems\Laravel\Events;
+-
+-use AllSystems\Laravel\MaintenancePayload;
+-
+-/** Fired when `X-AllSystems-Event: maintenance.ended` is received. */
+-final readonly class MaintenanceEnded
+-{
+-    public function __construct(
+-        public MaintenancePayload $payload,
+-    ) {
+-    }
+-}
+diff --git a/src/Events/MaintenanceStarted.php b/src/Events/MaintenanceStarted.php
+deleted file mode 100644
+index 56a5e7e..0000000
+--- a/src/Events/MaintenanceStarted.php
++++ /dev/null
+@@ -1,16 +0,0 @@
+-<?php
+-
+-declare(strict_types=1);
+-
+-namespace AllSystems\Laravel\Events;
+-
+-use AllSystems\Laravel\MaintenancePayload;
+-
+-/** Fired when `X-AllSystems-Event: maintenance.started` is received. */
+-final readonly class MaintenanceStarted
+-{
+-    public function __construct(
+-        public MaintenancePayload $payload,
+-    ) {
+-    }
+-}
+diff --git a/src/Events/PingReceived.php b/src/Events/PingReceived.php
+deleted file mode 100644
+index 6958da2..0000000
+--- a/src/Events/PingReceived.php
++++ /dev/null
+@@ -1,15 +0,0 @@
+-<?php
+-
+-declare(strict_types=1);
+-
+-namespace AllSystems\Laravel\Events;
+-
+-/** Fired when `X-AllSystems-Event: ping` is received. */
+-final readonly class PingReceived
+-{
+-    public function __construct(
+-        public string $applicationId,
+-        public string $applicationName,
+-    ) {
+-    }
+-}
+diff --git a/src/Http/Controllers/WebhookController.php b/src/Http/Controllers/WebhookController.php
+index 38b4374..0a963ec 100644
+--- a/src/Http/Controllers/WebhookController.php
++++ b/src/Http/Controllers/WebhookController.php
+@@ -1,91 +1,64 @@
+ <?php
+ 
+ declare(strict_types=1);
+ 
+ namespace AllSystems\Laravel\Http\Controllers;
+ 
+-use AllSystems\Laravel\Events\MaintenanceEnded;
+-use AllSystems\Laravel\Events\MaintenanceStarted;
+-use AllSystems\Laravel\Events\PingReceived;
+-use AllSystems\Laravel\MaintenancePayload;
+-use AllSystems\Laravel\SyncResult;
+-use Illuminate\Contracts\Events\Dispatcher;
++use AllSystems\Laravel\PlatformMaintenance;
+ use Illuminate\Http\JsonResponse;
+ use Illuminate\Http\Request;
+-use InvalidArgumentException;
+ use JsonException;
+ 
+ /**
+- * One action, three events, and a flat 200 for anything it understood.
++ * Applies a signed AllSystems delivery to the platform maintenance window.
+  *
+- * The response body is informational — AllSystems treats any 2xx as delivered —
+- * but `action` is what makes a redelivery legible in a log: `noop` says the
+- * receiver had already applied this exact window, which is the correct and
+- * expected answer to at-least-once delivery, not a warning.
+- *
+- * Unknown events are a 200 `noop`, deliberately. A future AllSystems that adds
+- * an event type must not find every deployed receiver retrying it for twenty
+- * minutes and then marking it failed.
++ * The event comes from the signed body, never the X-AllSystems-Event header, which the signature does not cover.
++ * Unknown events answer 200 `ignored`, so a future event type is not retried by every deployed receiver.
+  */
+-final readonly class WebhookController
++final class WebhookController
+ {
+-    public function __construct(
+-        private Dispatcher $events,
+-        private SyncResult $result,
+-    ) {
++    public function __construct(private readonly PlatformMaintenance $maintenance)
++    {
+     }
+ 
+     public function __invoke(Request $request): JsonResponse
+     {
+         try {
+-            $decoded = json_decode($request->getContent(), true, 512, JSON_THROW_ON_ERROR);
++            $payload = json_decode($request->getContent(), true, 512, JSON_THROW_ON_ERROR);
+         } catch (JsonException) {
+-            return new JsonResponse(['ok' => false, 'error' => 'Body is not valid JSON.'], 400);
++            return $this->invalid();
+         }
+ 
+-        if (!is_array($decoded)) {
+-            // A scalar-bodied signed request was a 500 (TypeError out of
+-            // MaintenancePayload::fromArray's array type hint), not a 400.
+-            return new JsonResponse(['ok' => false, 'error' => 'Body must be a JSON object.'], 400);
++        if (!is_array($payload) || !is_string($payload['event'] ?? null)) {
++            return $this->invalid();
+         }
+ 
+-        /** @var array<string, mixed> $body */
+-        $body = $decoded;
+-
+-        $event = $request->headers->get('X-AllSystems-Event', '');
+-
+-        $declaredEvent = $body['event'] ?? null;
++        if ($payload['event'] === 'ping') {
++            return $this->answer('noop');
++        }
+ 
+-        if (is_string($declaredEvent) && $declaredEvent !== $event) {
+-            // The signature covers the body, not this header. Without this check
+-            // a captured `maintenance.started` delivery is byte-for-byte a valid
+-            // `maintenance.ended` with the header flipped.
+-            return new JsonResponse(['ok' => false, 'error' => 'Event header does not match the signed body.'], 400);
++        if ($payload['event'] !== 'maintenance.started' && $payload['event'] !== 'maintenance.ended') {
++            return $this->answer('ignored');
+         }
+ 
+-        try {
+-            match ($event) {
+-                'maintenance.started' => $this->events->dispatch(new MaintenanceStarted(MaintenancePayload::fromArray($body))),
+-                'maintenance.ended' => $this->events->dispatch(new MaintenanceEnded(MaintenancePayload::fromArray($body))),
+-                'ping' => $this->events->dispatch(self::ping($body)),
+-                default => null,
+-            };
+-        } catch (InvalidArgumentException $e) {
+-            return new JsonResponse(['ok' => false, 'error' => $e->getMessage()], 422);
++        $id = $payload['id'] ?? null;
++
++        if (!is_string($id) || $id === '') {
++            return $this->invalid();
+         }
+ 
+-        return new JsonResponse(['ok' => true, 'action' => $this->result->action]);
++        return $this->answer(
++            $payload['event'] === 'maintenance.ended' ? $this->maintenance->end($id) : $this->maintenance->start($id),
++        );
+     }
+ 
+-    /** @param array<string, mixed> $body */
+-    private static function ping(array $body): PingReceived
++    private function invalid(): JsonResponse
+     {
+-        /** @var array<string, mixed> $application */
+-        $application = is_array($body['application'] ?? null) ? $body['application'] : [];
++        return new JsonResponse(['error' => 'Invalid payload'], 400);
++    }
+ 
+-        return new PingReceived(
+-            applicationId: is_string($application['id'] ?? null) ? $application['id'] : '',
+-            applicationName: is_string($application['name'] ?? null) ? $application['name'] : '',
+-        );
++    private function answer(string $action): JsonResponse
++    {
++        return new JsonResponse(['action' => $action], 200);
+     }
+ }
+diff --git a/src/Http/Middleware/PlatformMaintenanceMiddleware.php b/src/Http/Middleware/PlatformMaintenanceMiddleware.php
+new file mode 100644
+index 0000000..0b12f44
+--- /dev/null
++++ b/src/Http/Middleware/PlatformMaintenanceMiddleware.php
+@@ -0,0 +1,80 @@
++<?php
++
++declare(strict_types=1);
++
++namespace AllSystems\Laravel\Http\Middleware;
++
++use AllSystems\Laravel\PlatformMaintenance;
++use Closure;
++use Illuminate\Contracts\Config\Repository as ConfigRepository;
++use Illuminate\Contracts\Routing\ResponseFactory;
++use Illuminate\Http\JsonResponse;
++use Illuminate\Http\Request;
++use Symfony\Component\HttpFoundation\Response;
++
++/**
++ * 503s every request during a platform window without touching the database, which a release may be migrating.
++ * Exempt: the webhook path, so `ended` lands, plus allsystems.except (default `up`, for deploy smoke checks).
++ */
++final class PlatformMaintenanceMiddleware
++{
++    public function __construct(
++        private readonly PlatformMaintenance $maintenance,
++        private readonly ResponseFactory $responses,
++        private readonly ConfigRepository $config,
++    ) {
++    }
++
++    public function handle(Request $request, Closure $next): Response
++    {
++        // Exemptions first, so they never read the cache.
++        if ($request->is(...$this->exemptPaths()) || !$this->maintenance->isActive()) {
++            return $next($request);
++        }
++
++        // no-store so the edge never caches the outage past the window.
++        $headers = [
++            'Retry-After' => $this->setting('allsystems.retry_after'),
++            'Cache-Control' => 'no-store',
++        ];
++
++        if ($request->expectsJson()) {
++            return new JsonResponse(
++                [
++                    'errors' => [
++                        [
++                            'status' => '503',
++                            'title' => 'Service Unavailable',
++                            'code' => 'platform_maintenance',
++                            'detail' => $this->config->get('allsystems.json_detail'),
++                        ],
++                    ],
++                ],
++                Response::HTTP_SERVICE_UNAVAILABLE,
++                ['Content-Type' => 'application/vnd.api+json'] + $headers,
++            );
++        }
++
++        return $this->responses->view(
++            $this->setting('allsystems.view'),
++            [],
++            Response::HTTP_SERVICE_UNAVAILABLE,
++            $headers,
++        );
++    }
++
++    private function setting(string $key): string
++    {
++        $value = $this->config->get($key);
++
++        return is_scalar($value) ? (string) $value : '';
++    }
++
++    /** @return list<string> */
++    private function exemptPaths(): array
++    {
++        $paths = [$this->config->get('allsystems.path'), ...(array) $this->config->get('allsystems.except')];
++
++        return array_values(array_filter($paths, is_string(...)));
++    }
++}
+diff --git a/src/Http/Middleware/VerifySignature.php b/src/Http/Middleware/VerifySignature.php
+index d53ceb3..6b27722 100644
+--- a/src/Http/Middleware/VerifySignature.php
++++ b/src/Http/Middleware/VerifySignature.php
+@@ -1,109 +1,90 @@
+ <?php
+ 
+ declare(strict_types=1);
+ 
+ namespace AllSystems\Laravel\Http\Middleware;
+ 
+ use Closure;
+ use Illuminate\Contracts\Config\Repository as ConfigRepository;
++use Illuminate\Http\JsonResponse;
+ use Illuminate\Http\Request;
++use Psr\Clock\ClockInterface;
++use Psr\Log\LoggerInterface;
+ use Symfony\Component\HttpFoundation\Response;
+ 
+ /**
+- * The only thing standing between the public internet and your app's
+- * maintenance mode.
++ * Admits only deliveries AllSystems signed: `X-AllSystems-Signature: t=<unix>,v1=<hmac-sha256 of "t.body">`.
+  *
+- *   X-AllSystems-Signature: t=<unix seconds>,v1=<hex hmac-sha256>
+- *   v1 = HMAC-SHA256(secret, "{t}.{raw request body}")
+- *
+- * Three checks, all of which must pass:
+- *
+- *  1. The header parses into a `t` and a `v1`.
+- *  2. |now - t| is within the configured tolerance. Without this, a signature
+- *     captured once is valid forever and anyone who ever saw one can take the
+- *     app down at will.
+- *  3. hash_equals() over the two hex digests. Never `===`: a timing-variable
+- *     comparison over an attacker-supplied digest leaks the expected value one
+- *     byte at a time.
+- *
+- * The RAW body is what is signed — $request->getContent(), never a re-encode of
+- * $request->json(). Re-encoding can change key order, whitespace or unicode
+- * escaping, and the digest would then be over something the sender never sent.
++ * Fails closed with no secret configured. The timestamp window bounds replays of a captured delivery.
+  */
+-final readonly class VerifySignature
++final class VerifySignature
+ {
+     public const HEADER = 'X-AllSystems-Signature';
+ 
+-    public function __construct(private ConfigRepository $config)
+-    {
++    public function __construct(
++        private readonly ConfigRepository $config,
++        private readonly ClockInterface $clock,
++        private readonly LoggerInterface $logger,
++    ) {
+     }
+ 
+     public function handle(Request $request, Closure $next): Response
+     {
+         $secret = $this->config->get('allsystems.secret');
+ 
+         if (!is_string($secret) || $secret === '') {
+-            // Unconfigured, not misconfigured — but the answer is the same:
+-            // nothing is authenticated, so nothing gets through.
+-            return $this->reject('AllSystems webhook secret is not configured.');
++            return $this->reject('secret_unset');
+         }
+ 
+-        $parsed = self::parse((string) $request->headers->get(self::HEADER, ''));
++        $parts = $this->parse((string) $request->headers->get(self::HEADER));
+ 
+-        if ($parsed === null) {
+-            return $this->reject('Malformed or missing signature header.');
++        if ($parts === null) {
++            return $this->reject('malformed_header');
+         }
+ 
+-        [$timestamp, $provided] = $parsed;
+-
++        [$timestamp, $signature] = $parts;
+         $configuredTolerance = $this->config->get('allsystems.tolerance', 300);
+         $tolerance = is_numeric($configuredTolerance) ? (int) $configuredTolerance : 300;
+ 
+-        if (abs(time() - $timestamp) > $tolerance) {
+-            return $this->reject('Signature timestamp is outside the tolerance window.');
++        if (abs($this->clock->now()->getTimestamp() - $timestamp) > $tolerance) {
++            return $this->reject('timestamp_out_of_tolerance');
+         }
+ 
++        // The raw body: a re-encode would not be byte-identical to what AllSystems signed.
+         $expected = hash_hmac('sha256', $timestamp . '.' . $request->getContent(), $secret);
+ 
+-        if (!hash_equals($expected, $provided)) {
+-            return $this->reject('Signature does not match.');
++        if (!hash_equals($expected, $signature)) {
++            return $this->reject('signature_mismatch');
+         }
+ 
+         return $next($request);
+     }
+ 
+-    /** @return array{0: int, 1: string}|null */
+-    private static function parse(string $header): ?array
++    /** @return array{int, string}|null */
++    private function parse(string $header): ?array
+     {
+-        $timestamp = null;
+-        $v1 = null;
++        $fields = [];
+ 
+-        foreach (explode(',', $header) as $part) {
+-            $pair = explode('=', trim($part), 2);
+-
+-            if (count($pair) !== 2) {
+-                continue;
+-            }
+-
+-            [$key, $value] = $pair;
++        foreach (explode(',', $header) as $pair) {
++            [$key, $value] = array_pad(explode('=', trim($pair), 2), 2, '');
++            $fields[$key] = $value;
++        }
+ 
+-            if ($key === 't' && preg_match('/^\d{1,10}$/', $value) === 1) {
+-                $timestamp = (int) $value;
+-            }
++        $timestamp = $fields['t'] ?? '';
++        $signature = $fields['v1'] ?? '';
+ 
+-            if ($key === 'v1' && preg_match('/^[0-9a-f]{64}$/', $value) === 1) {
+-                $v1 = $value;
+-            }
++        if (preg_match('/^\d{1,10}$/', $timestamp) !== 1 || preg_match('/^[0-9a-f]{64}$/', $signature) !== 1) {
++            return null;
+         }
+ 
+-        return $timestamp === null || $v1 === null ? null : [$timestamp, $v1];
++        return [(int) $timestamp, $signature];
+     }
+ 
+-    private function reject(string $reason): Response
++    private function reject(string $reason): JsonResponse
+     {
+-        // 401 and a bare reason. AllSystems records the status code, retries
+-        // for ~19 minutes, and a mid-window secret rotation therefore heals
+-        // itself once the app's ALLSYSTEMS_WEBHOOK_SECRET is updated.
+-        return new \Illuminate\Http\JsonResponse(['ok' => false, 'error' => $reason], 401);
++        // The reason only: never the header or the body.
++        $this->logger->warning('allsystems.webhook_rejected', ['reason' => $reason]);
++
++        return new JsonResponse(['error' => 'Invalid signature'], Response::HTTP_UNAUTHORIZED);
+     }
+ }
+diff --git a/src/Listeners/SyncMaintenanceMode.php b/src/Listeners/SyncMaintenanceMode.php
+deleted file mode 100644
+index b5d957c..0000000
+--- a/src/Listeners/SyncMaintenanceMode.php
++++ /dev/null
+@@ -1,132 +0,0 @@
+-<?php
+-
+-declare(strict_types=1);
+-
+-namespace AllSystems\Laravel\Listeners;
+-
+-use AllSystems\Laravel\Events\MaintenanceEnded;
+-use AllSystems\Laravel\Events\MaintenanceStarted;
+-use AllSystems\Laravel\SyncResult;
+-use DateTimeImmutable;
+-use Illuminate\Contracts\Config\Repository as ConfigRepository;
+-use Illuminate\Contracts\Foundation\MaintenanceMode;
+-use Illuminate\Contracts\View\Factory as ViewFactory;
+-use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance;
+-
+-/**
+- * Drives Laravel's own maintenance mode from an AllSystems window.
+- *
+- * Everything here goes through the MaintenanceMode contract and nothing else.
+- * Whichever driver backs it — file, cache, something you wrote — is your app's
+- * `APP_MAINTENANCE_DRIVER` choice and this package neither knows nor cares.
+- * That is what makes it work identically on one box, a fleet and Lambda.
+- *
+- * The id guard on deactivate() is the most important line in the package. An
+- * operator who ran `artisan down` by hand has no allsystems_maintenance_id in
+- * the payload; a *different* AllSystems window has a different one. In either
+- * case AllSystems must not lift it. Getting this wrong means a scheduled
+- * window's end quietly brings a deliberately-downed production app back up.
+- */
+-final readonly class SyncMaintenanceMode
+-{
+-    /** The marker that makes a maintenance mode ours. */
+-    public const ID_KEY = 'allsystems_maintenance_id';
+-
+-    public function __construct(
+-        private MaintenanceMode $maintenanceMode,
+-        private ConfigRepository $config,
+-        private ViewFactory $views,
+-        private SyncResult $result,
+-        private PreventRequestsDuringMaintenance $exemptions,
+-    ) {
+-    }
+-
+-    public function handleStarted(MaintenanceStarted $event): void
+-    {
+-        $payload = $event->payload;
+-        $active = $this->maintenanceMode->active();
+-        $data = $active ? $this->maintenanceMode->data() : [];
+-
+-        if ($active && ($data[self::ID_KEY] ?? null) === $payload->id) {
+-            // A redelivery of a window we already applied. At-least-once
+-            // delivery makes this normal, not exceptional.
+-            $this->result->action = 'noop';
+-
+-            return;
+-        }
+-
+-        if ($active && !array_key_exists(self::ID_KEY, $data)) {
+-            // Not ours (a hand-run `artisan down`, or another package). Not ours
+-            // to take over, and therefore not ours to lift later.
+-            $this->result->action = 'noop';
+-
+-            return;
+-        }
+-
+-        $retry = $payload->retryAfterSeconds(new DateTimeImmutable());
+-
+-        // Laravel's PreventRequestsDuringMaintenance reads these with isset(),
+-        // so a null is correctly ignored — but only if the key's VALUE is null.
+-        // The keys mirror Illuminate\Foundation\Console\DownCommand exactly, so
+-        // an AllSystems-driven down behaves the same as `artisan down`.
+-        $this->maintenanceMode->activate([
+-            'except' => $this->exemptions->getExcludedPaths(),
+-            'redirect' => self::nullableString($this->config->get('allsystems.maintenance.redirect')),
+-            'retry' => $retry,
+-            'refresh' => self::nullableInt($this->config->get('allsystems.maintenance.refresh')),
+-            'secret' => self::nullableString($this->config->get('allsystems.maintenance.secret')),
+-            'status' => 503,
+-            'template' => $this->template($retry),
+-            self::ID_KEY => $payload->id,
+-        ]);
+-
+-        $this->result->action = 'activated';
+-    }
+-
+-    public function handleEnded(MaintenanceEnded $event): void
+-    {
+-        if (!$this->maintenanceMode->active()) {
+-            $this->result->action = 'noop';
+-
+-            return;
+-        }
+-
+-        if (($this->maintenanceMode->data()[self::ID_KEY] ?? null) !== $event->payload->id) {
+-            // Somebody else's maintenance mode — a hand-run `artisan down`, or
+-            // a different window. Not ours to lift.
+-            $this->result->action = 'noop';
+-
+-            return;
+-        }
+-
+-        $this->maintenanceMode->deactivate();
+-        $this->result->action = 'deactivated';
+-    }
+-
+-    /**
+-     * `template` must be pre-rendered HTML, not a view name — Laravel serves
+-     * the string verbatim, and DownCommand renders the view itself for exactly
+-     * this reason. `retryAfter` is the variable Laravel's own maintenance views
+-     * expect.
+-     */
+-    private function template(int $retry): ?string
+-    {
+-        $view = self::nullableString($this->config->get('allsystems.maintenance.template'));
+-
+-        if ($view === null) {
+-            return null;
+-        }
+-
+-        return $this->views->make($view, ['retryAfter' => $retry])->render();
+-    }
+-
+-    private static function nullableString(mixed $value): ?string
+-    {
+-        return is_string($value) && $value !== '' ? $value : null;
+-    }
+-
+-    private static function nullableInt(mixed $value): ?int
+-    {
+-        return is_numeric($value) ? (int) $value : null;
+-    }
+-}
+diff --git a/src/MaintenancePayload.php b/src/MaintenancePayload.php
+deleted file mode 100644
+index 26b5ed1..0000000
+--- a/src/MaintenancePayload.php
++++ /dev/null
+@@ -1,109 +0,0 @@
+-<?php
+-
+-declare(strict_types=1);
+-
+-namespace AllSystems\Laravel;
+-
+-use DateTimeImmutable;
+-use DateTimeZone;
+-use InvalidArgumentException;
+-
+-/**
+- * The `maintenance.started` / `maintenance.ended` body, typed.
+- *
+- * Parsing is strict: a body missing a field, or carrying an unparseable
+- * timestamp, is a contract violation and must be rejected loudly rather than
+- * quietly defaulted. A payload that half-parses is how an application ends up
+- * in maintenance mode with a retry-after of zero.
+- */
+-final readonly class MaintenancePayload
+-{
+-    /** @param list<array{id: string, name: string}> $components */
+-    public function __construct(
+-        public string $id,
+-        public string $title,
+-        public string $message,
+-        public DateTimeImmutable $startsAt,
+-        public DateTimeImmutable $endsAt,
+-        public array $components,
+-    ) {
+-    }
+-
+-    /**
+-     * @param array<string, mixed> $body
+-     *
+-     * @throws InvalidArgumentException
+-     */
+-    public static function fromArray(array $body): self
+-    {
+-        $components = [];
+-
+-        /** @var list<mixed> $rawComponents */
+-        $rawComponents = is_array($body['components'] ?? null) ? array_values($body['components']) : [];
+-
+-        foreach ($rawComponents as $component) {
+-            if (!is_array($component)) {
+-                continue;
+-            }
+-
+-            $components[] = [
+-                'id' => self::string($component, 'id'),
+-                'name' => self::string($component, 'name'),
+-            ];
+-        }
+-
+-        return new self(
+-            id: self::string($body, 'id'),
+-            title: self::string($body, 'title'),
+-            message: self::string($body, 'message'),
+-            startsAt: self::timestamp($body, 'starts_at'),
+-            endsAt: self::timestamp($body, 'ends_at'),
+-            components: $components,
+-        );
+-    }
+-
+-    /**
+-     * Seconds until the window is planned to end, for Laravel's Retry-After.
+-     *
+-     * Floored at 60: a Retry-After of 0 or a negative one tells a crawler to
+-     * come straight back, and a window whose planned end has already passed
+-     * (a redelivery, or an operator who extended it) still wants a sane hint
+-     * rather than a hostile one.
+-     */
+-    public function retryAfterSeconds(DateTimeImmutable $now): int
+-    {
+-        return max(60, $this->endsAt->getTimestamp() - $now->getTimestamp());
+-    }
+-
+-    /** @param array<array-key, mixed> $source */
+-    private static function string(array $source, string $key): string
+-    {
+-        $value = $source[$key] ?? null;
+-
+-        if (!is_string($value) || $value === '') {
+-            throw new InvalidArgumentException(sprintf('Missing or non-string "%s" in the AllSystems webhook payload.', $key));
+-        }
+-
+-        return $value;
+-    }
+-
+-    /** @param array<string, mixed> $source */
+-    private static function timestamp(array $source, string $key): DateTimeImmutable
+-    {
+-        $raw = self::string($source, $key);
+-        $parsed = DateTimeImmutable::createFromFormat('Y-m-d\TH:i:s\Z', $raw, new DateTimeZone('UTC'));
+-
+-        if ($parsed === false || $parsed->format('Y-m-d\TH:i:s\Z') !== $raw) {
+-            throw new InvalidArgumentException(sprintf('Unparseable "%s" in the AllSystems webhook payload: %s', $key, $raw));
+-        }
+-
+-        // createFromFormat carries the current time's microseconds through even
+-        // when the format has no sub-second component, which makes two payloads
+-        // parsed a millisecond apart compare unequal.
+-        return $parsed->setTime(
+-            (int) $parsed->format('H'),
+-            (int) $parsed->format('i'),
+-            (int) $parsed->format('s'),
+-        );
+-    }
+-}
+diff --git a/src/PlatformMaintenance.php b/src/PlatformMaintenance.php
+new file mode 100644
+index 0000000..583d8b9
+--- /dev/null
++++ b/src/PlatformMaintenance.php
+@@ -0,0 +1,127 @@
++<?php
++
++declare(strict_types=1);
++
++namespace AllSystems\Laravel;
++
++use DateTimeImmutable;
++use Illuminate\Contracts\Cache\Factory as CacheFactory;
++use Illuminate\Contracts\Cache\Repository;
++use Illuminate\Contracts\Config\Repository as ConfigRepository;
++use Psr\Clock\ClockInterface;
++use Psr\Log\LoggerInterface;
++
++/**
++ * The flag lives in the default (shared) cache store, so every Lambda agrees on the window without the database
++ * a release may be migrating.
++ * It expires after allsystems.max_minutes, so a lost `ended` cannot keep the app down.
++ */
++final class PlatformMaintenance
++{
++    private const DEFAULT_KEY = 'allsystems:platform-maintenance';
++
++    public function __construct(
++        private readonly CacheFactory $cache,
++        private readonly ConfigRepository $config,
++        private readonly ClockInterface $clock,
++        private readonly LoggerInterface $logger,
++    ) {
++    }
++
++    /** @return 'activated'|'noop' */
++    public function start(string $windowId): string
++    {
++        $state = $this->state();
++
++        // A redelivery must not extend the window it already opened.
++        if ($state !== null && $state['id'] === $windowId && !$this->expired($state)) {
++            return 'noop';
++        }
++
++        $startedAt = $this->clock->now()->getTimestamp();
++        $this->store()->forever($this->key(), [
++            'id' => $windowId,
++            'started_at' => $startedAt,
++            'expires_at' => $startedAt + $this->maxMinutes() * 60,
++        ]);
++
++        $this->logger->info('platform_maintenance.started', ['id' => $windowId]);
++
++        return 'activated';
++    }
++
++    /** @return 'deactivated'|'noop' */
++    public function end(string $windowId): string
++    {
++        $state = $this->state();
++
++        // Another window's `ended` never lifts the current one.
++        if ($state === null || $state['id'] !== $windowId) {
++            return 'noop';
++        }
++
++        $this->store()->forget($this->key());
++        $this->logger->info('platform_maintenance.ended', ['id' => $windowId]);
++
++        return 'deactivated';
++    }
++
++    public function isActive(): bool
++    {
++        $state = $this->state();
++
++        if ($state === null) {
++            return false;
++        }
++
++        if ($this->expired($state)) {
++            $this->store()->forget($this->key());
++            $this->logger->warning('platform_maintenance.expired', [
++                'id' => $state['id'],
++                'started_at' => (new DateTimeImmutable('@' . $state['started_at']))->format(DATE_ATOM),
++            ]);
++
++            return false;
++        }
++
++        return true;
++    }
++
++    /** @return array{id: string, started_at: int, expires_at: int}|null */
++    private function state(): ?array
++    {
++        $state = $this->store()->get($this->key());
++
++        if (!is_array($state) || !is_string($state['id'] ?? null)
++            || !is_int($state['started_at'] ?? null) || !is_int($state['expires_at'] ?? null)) {
++            return null;
++        }
++
++        return ['id' => $state['id'], 'started_at' => $state['started_at'], 'expires_at' => $state['expires_at']];
++    }
++
++    /** @param array{id: string, started_at: int, expires_at: int} $state */
++    private function expired(array $state): bool
++    {
++        return $this->clock->now()->getTimestamp() >= $state['expires_at'];
++    }
++
++    private function maxMinutes(): int
++    {
++        $minutes = $this->config->get('allsystems.max_minutes');
++
++        return is_numeric($minutes) ? (int) $minutes : 30;
++    }
++
++    private function key(): string
++    {
++        $key = $this->config->get('allsystems.cache_key');
++
++        return is_string($key) && $key !== '' ? $key : self::DEFAULT_KEY;
++    }
++
++    private function store(): Repository
++    {
++        return $this->cache->store();
++    }
++}
+diff --git a/src/SyncResult.php b/src/SyncResult.php
+deleted file mode 100644
+index 5387b58..0000000
+--- a/src/SyncResult.php
++++ /dev/null
+@@ -1,15 +0,0 @@
+-<?php
+-
+-declare(strict_types=1);
+-
+-namespace AllSystems\Laravel;
+-
+-/**
+- * Request-scoped mutable holder the listener writes to and the controller
+- * reads from, so the controller can report what happened without knowing
+- * the listener — or any listener — exists.
+- */
+-final class SyncResult
+-{
+-    public string $action = 'noop';
+-}
+diff --git a/src/SystemClock.php b/src/SystemClock.php
+new file mode 100644
+index 0000000..7bc72cf
+--- /dev/null
++++ b/src/SystemClock.php
+@@ -0,0 +1,16 @@
++<?php
++
++declare(strict_types=1);
++
++namespace AllSystems\Laravel;
++
++use DateTimeImmutable;
++use Psr\Clock\ClockInterface;
++
++final class SystemClock implements ClockInterface
++{
++    public function now(): DateTimeImmutable
++    {
++        return new DateTimeImmutable();
++    }
++}
+diff --git a/tests/Doubles/FakeMaintenanceMode.php b/tests/Doubles/FakeMaintenanceMode.php
+deleted file mode 100644
+index 5133aed..0000000
+--- a/tests/Doubles/FakeMaintenanceMode.php
++++ /dev/null
+@@ -1,55 +0,0 @@
+-<?php
+-
+-declare(strict_types=1);
+-
+-namespace AllSystems\Laravel\Tests\Doubles;
+-
+-use Illuminate\Contracts\Foundation\MaintenanceMode;
+-
+-/**
+- * In-memory `MaintenanceMode` double. No filesystem, so a test built on this
+- * says nothing about the file driver, the cache driver, or any other — only
+- * about what SyncMaintenanceMode did through the contract.
+- *
+- * `activations` records every `activate()` payload, in order, so a test can
+- * assert both "how many times" and "with exactly what". `deactivateCalls`
+- * is the id-guard tests' load-bearing assertion: the guard exists to keep
+- * that count at zero for a maintenance mode AllSystems does not own.
+- */
+-final class FakeMaintenanceMode implements MaintenanceMode
+-{
+-    /** @var list<array<string, mixed>> */
+-    public array $activations = [];
+-
+-    public int $deactivateCalls = 0;
+-
+-    private bool $active = false;
+-
+-    /** @param array<string, mixed> $payload */
+-    public function activate(array $payload): void
+-    {
+-        $this->activations[] = $payload;
+-        $this->active = true;
+-    }
+-
+-    public function deactivate(): void
+-    {
+-        ++$this->deactivateCalls;
+-        $this->active = false;
+-    }
+-
+-    public function active(): bool
+-    {
+-        return $this->active;
+-    }
+-
+-    /** @return array<string, mixed> */
+-    public function data(): array
+-    {
+-        if ($this->activations === []) {
+-            return [];
+-        }
+-
+-        return $this->activations[array_key_last($this->activations)];
+-    }
+-}
+diff --git a/tests/Doubles/MockClockProvider.php b/tests/Doubles/MockClockProvider.php
+new file mode 100644
+index 0000000..eb6f7af
+--- /dev/null
++++ b/tests/Doubles/MockClockProvider.php
+@@ -0,0 +1,17 @@
++<?php
++
++declare(strict_types=1);
++
++namespace AllSystems\Laravel\Tests\Doubles;
++
++use Illuminate\Support\ServiceProvider;
++use Psr\Clock\ClockInterface;
++use Symfony\Component\Clock\MockClock;
++
++final class MockClockProvider extends ServiceProvider
++{
++    public function register(): void
++    {
++        $this->app->instance(ClockInterface::class, new MockClock());
++    }
++}
+diff --git a/tests/MaintenancePayloadTest.php b/tests/MaintenancePayloadTest.php
+deleted file mode 100644
+index 7960adf..0000000
+--- a/tests/MaintenancePayloadTest.php
++++ /dev/null
+@@ -1,170 +0,0 @@
+-<?php
+-
+-declare(strict_types=1);
+-
+-namespace AllSystems\Laravel\Tests;
+-
+-use AllSystems\Laravel\MaintenancePayload;
+-use DateTimeImmutable;
+-use InvalidArgumentException;
+-use PHPUnit\Framework\TestCase;
+-
+-/**
+- * Golden vector 1's body is reproduced verbatim from the plan's §"Golden
+- * signature vectors" — Part A generates it, Part B (this file) only parses
+- * it, so it is never recomputed or reformatted here.
+- */
+-final class MaintenancePayloadTest extends TestCase
+-{
+-    private const GOLDEN_VECTOR_1_BODY = '{"id":"01920000-0000-7000-8000-00000000a001","event":"maintenance.started","title":"Database upgrade","message":"Upgrading PostgreSQL. Expect ~20 minutes of downtime.","starts_at":"2026-08-20T01:00:00Z","ends_at":"2026-08-20T01:30:00Z","components":[{"id":"01920000-0000-7000-8000-00000000c001","name":"Web app"},{"id":"01920000-0000-7000-8000-00000000c002","name":"Queue worker"}]}';
+-
+-    public function testFromArrayParsesGoldenVector1(): void
+-    {
+-        /** @var array<string, mixed> $body */
+-        $body = json_decode(self::GOLDEN_VECTOR_1_BODY, true, 512, JSON_THROW_ON_ERROR);
+-
+-        $payload = MaintenancePayload::fromArray($body);
+-
+-        self::assertSame('01920000-0000-7000-8000-00000000a001', $payload->id);
+-        self::assertSame('Database upgrade', $payload->title);
+-        self::assertSame('Upgrading PostgreSQL. Expect ~20 minutes of downtime.', $payload->message);
+-        self::assertSame('2026-08-20T01:00:00+00:00', $payload->startsAt->format(DATE_ATOM));
+-        self::assertSame('2026-08-20T01:30:00+00:00', $payload->endsAt->format(DATE_ATOM));
+-        self::assertSame(
+-            [
+-                ['id' => '01920000-0000-7000-8000-00000000c001', 'name' => 'Web app'],
+-                ['id' => '01920000-0000-7000-8000-00000000c002', 'name' => 'Queue worker'],
+-            ],
+-            $payload->components,
+-        );
+-    }
+-
+-    public function testComponentsDefaultsToEmptyArrayWhenKeyIsAbsent(): void
+-    {
+-        $body = $this->validBody();
+-        unset($body['components']);
+-
+-        $payload = MaintenancePayload::fromArray($body);
+-
+-        self::assertSame([], $payload->components);
+-    }
+-
+-    public function testFromArrayRejectsMissingId(): void
+-    {
+-        $body = $this->validBody();
+-        unset($body['id']);
+-
+-        $this->expectException(InvalidArgumentException::class);
+-        $this->expectExceptionMessage('Missing or non-string "id"');
+-
+-        MaintenancePayload::fromArray($body);
+-    }
+-
+-    public function testFromArrayRejectsMissingStartsAt(): void
+-    {
+-        $body = $this->validBody();
+-        unset($body['starts_at']);
+-
+-        $this->expectException(InvalidArgumentException::class);
+-        $this->expectExceptionMessage('Missing or non-string "starts_at"');
+-
+-        MaintenancePayload::fromArray($body);
+-    }
+-
+-    public function testFromArrayRejectsEmptyStringTitle(): void
+-    {
+-        $body = $this->validBody();
+-        $body['title'] = '';
+-
+-        $this->expectException(InvalidArgumentException::class);
+-        $this->expectExceptionMessage('Missing or non-string "title"');
+-
+-        MaintenancePayload::fromArray($body);
+-    }
+-
+-    public function testFromArrayRejectsNumericId(): void
+-    {
+-        $body = $this->validBody();
+-        $body['id'] = 12345;
+-
+-        $this->expectException(InvalidArgumentException::class);
+-        $this->expectExceptionMessage('Missing or non-string "id"');
+-
+-        MaintenancePayload::fromArray($body);
+-    }
+-
+-    /**
+-     * AllSystems always sends the literal `Z` suffix, never a numeric offset.
+-     * A body carrying `+00:00` instead is not a format this parser accepts,
+-     * even though it names the same instant.
+-     */
+-    public function testFromArrayRejectsStartsAtWithNumericOffsetInsteadOfZ(): void
+-    {
+-        $body = $this->validBody();
+-        $body['starts_at'] = '2026-08-20T01:00:00+00:00';
+-
+-        $this->expectException(InvalidArgumentException::class);
+-        $this->expectExceptionMessage('Unparseable "starts_at"');
+-
+-        MaintenancePayload::fromArray($body);
+-    }
+-
+-    /**
+-     * M2: DateTimeImmutable::createFromFormat silently rolls impossible
+-     * dates over into the next valid one instead of failing — 2026-02-31
+-     * becomes 2026-03-03. That must be rejected loudly, per this class's own
+-     * docblock, not turned into a plausible-looking but wrong Retry-After.
+-     */
+-    public function testFromArrayRejectsAnImpossibleStartsAtInsteadOfRollingItOver(): void
+-    {
+-        $body = $this->validBody();
+-        $body['starts_at'] = '2026-02-31T00:00:00Z';
+-
+-        $this->expectException(InvalidArgumentException::class);
+-        $this->expectExceptionMessage('Unparseable "starts_at"');
+-
+-        MaintenancePayload::fromArray($body);
+-    }
+-
+-    public function testFromArrayRejectsAnImpossibleEndsAtInsteadOfRollingItOver(): void
+-    {
+-        $body = $this->validBody();
+-        $body['ends_at'] = '2026-13-45T99:00:00Z';
+-
+-        $this->expectException(InvalidArgumentException::class);
+-        $this->expectExceptionMessage('Unparseable "ends_at"');
+-
+-        MaintenancePayload::fromArray($body);
+-    }
+-
+-    public function testRetryAfterSecondsReturnsRealRemainderMidWindow(): void
+-    {
+-        /** @var array<string, mixed> $body */
+-        $body = json_decode(self::GOLDEN_VECTOR_1_BODY, true, 512, JSON_THROW_ON_ERROR);
+-        $payload = MaintenancePayload::fromArray($body);
+-
+-        $now = new DateTimeImmutable('2026-08-20T01:27:00Z');
+-
+-        self::assertSame(180, $payload->retryAfterSeconds($now));
+-    }
+-
+-    public function testRetryAfterSecondsIsFlooredAtSixtyWhenWindowHasAlreadyEnded(): void
+-    {
+-        /** @var array<string, mixed> $body */
+-        $body = json_decode(self::GOLDEN_VECTOR_1_BODY, true, 512, JSON_THROW_ON_ERROR);
+-        $payload = MaintenancePayload::fromArray($body);
+-
+-        $now = new DateTimeImmutable('2026-08-20T02:00:00Z');
+-
+-        self::assertSame(60, $payload->retryAfterSeconds($now));
+-    }
+-
+-    /** @return array<string, mixed> */
+-    private function validBody(): array
+-    {
+-        /** @var array<string, mixed> $body */
+-        $body = json_decode(self::GOLDEN_VECTOR_1_BODY, true, 512, JSON_THROW_ON_ERROR);
+-
+-        return $body;
+-    }
+-}
+diff --git a/tests/PlatformMaintenanceMiddlewareTest.php b/tests/PlatformMaintenanceMiddlewareTest.php
+new file mode 100644
+index 0000000..4220ff5
+--- /dev/null
++++ b/tests/PlatformMaintenanceMiddlewareTest.php
+@@ -0,0 +1,172 @@
++<?php
++
++declare(strict_types=1);
++
++namespace AllSystems\Laravel\Tests;
++
++use AllSystems\Laravel\Http\Middleware\PlatformMaintenanceMiddleware;
++use AllSystems\Laravel\Http\Middleware\VerifySignature;
++use AllSystems\Laravel\PlatformMaintenance;
++use Illuminate\Contracts\Config\Repository as ConfigRepository;
++use Illuminate\Contracts\Http\Kernel as HttpKernelContract;
++use Illuminate\Database\Events\QueryExecuted;
++use Illuminate\Foundation\Http\Kernel as FoundationHttpKernel;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Route;
++use Illuminate\Support\Facades\View;
++use Illuminate\Testing\TestResponse;
++use Symfony\Component\HttpFoundation\Response;
++
++final class PlatformMaintenanceMiddlewareTest extends TestCase
++{
++    protected function setUp(): void
++    {
++        parent::setUp();
++
++        $app = $this->app;
++        assert($app !== null);
++
++        $kernel = $app->make(HttpKernelContract::class);
++        assert($kernel instanceof FoundationHttpKernel);
++        $kernel->pushMiddleware(PlatformMaintenanceMiddleware::class);
++
++        Route::get('/', static fn () => 'home');
++        Route::get('/up', static fn () => 'up');
++        Route::get('/status', static fn () => 'status');
++        Route::post('/other', static fn () => 'other');
++    }
++
++    public function testAnOpenWindowAnswersTheHtmlPage(): void
++    {
++        $this->startWindow();
++        config(['app.name' => 'Acme']);
++        $name = 'Acme';
++
++        $response = $this->get('/');
++
++        $response->assertStatus(503);
++        $this->assertOutageHeaders($response);
++        $response->assertSee("<title>{$name} – back in a minute</title>", false);
++        $response->assertSee("We're updating {$name}", false);
++        $response->assertSee("We'll be back in a minute", false);
++        $response->assertDontSee('http', false);
++    }
++
++    public function testAJsonRequestAnswersTheCodedError(): void
++    {
++        $this->startWindow();
++
++        $response = $this->getJson('/', ['Accept' => 'application/vnd.api+json']);
++
++        $response->assertStatus(503);
++        $this->assertOutageHeaders($response);
++        self::assertSame('application/vnd.api+json', $response->headers->get('Content-Type'));
++        $response->assertExactJson([
++            'errors' => [
++                [
++                    'status' => '503',
++                    'title' => 'Service Unavailable',
++                    'code' => 'platform_maintenance',
++                    'detail' => "We're doing some scheduled maintenance. Please try again in a minute or two.",
++                ],
++            ],
++        ]);
++    }
++
++    public function testUpIsNotAnsweredByTheGate(): void
++    {
++        $this->startWindow();
++
++        $this->get('/up')->assertOk();
++    }
++
++    public function testTheEndedWebhookReachesItsControllerAndClosesTheWindow(): void
++    {
++        $this->startWindow();
++        $body = '{"event":"maintenance.ended","id":"window-1"}';
++
++        $this->call('POST', '/webhooks/allsystems', [], [], [], $this->signedHeaders($body), $body)
++            ->assertOk()
++            ->assertExactJson(['action' => 'deactivated'])
++        ;
++        $this->get('/')->assertOk();
++    }
++
++    public function testAPostIsTurnedAway(): void
++    {
++        $this->startWindow();
++
++        $this->post('/other')->assertStatus(503);
++    }
++
++    public function testAnExtraExceptPathPasses(): void
++    {
++        config(['allsystems.except' => ['up', 'status']]);
++        $this->startWindow();
++
++        $this->get('/status')->assertOk();
++        $this->get('/')->assertStatus(503);
++    }
++
++    public function testWithNoWindowOpenNothingIsTurnedAwayAndNoQueryRuns(): void
++    {
++        config(['app.maintenance.store' => 'database']);
++        $queries = [];
++        DB::listen(static function (QueryExecuted $query) use (&$queries): void {
++            $queries[] = $query->sql;
++        });
++
++        $this->get('/')->assertOk();
++        $this->post('/other')->assertOk();
++        self::assertSame([], $queries);
++    }
++
++    public function testAStartedWindowStill503sWithTheMaintenanceStoreSetToDatabase(): void
++    {
++        config(['app.maintenance.store' => 'database']);
++        $this->startWindow();
++
++        $this->get('/')->assertStatus(503);
++    }
++
++    public function testTheOutageResponseIsConfigurable(): void
++    {
++        $this->app?->make(ConfigRepository::class)->set([
++            'allsystems.retry_after' => 120,
++            'allsystems.json_detail' => 'Back soon.',
++            'allsystems.view' => 'custom-outage',
++        ]);
++        View::addLocation(__DIR__ . '/views');
++        $this->startWindow();
++
++        $html = $this->get('/');
++        $html->assertStatus(503);
++        self::assertSame('120', $html->headers->get('Retry-After'));
++        $html->assertSee('custom outage page', false);
++
++        $this->getJson('/')->assertStatus(503)->assertJsonPath('errors.0.detail', 'Back soon.');
++    }
++
++    private function startWindow(): void
++    {
++        $this->app?->make(PlatformMaintenance::class)->start('window-1');
++    }
++
++    /** @param TestResponse<Response> $response */
++    private function assertOutageHeaders(TestResponse $response): void
++    {
++        self::assertSame('60', $response->headers->get('Retry-After'));
++        self::assertStringContainsString('no-store', (string) $response->headers->get('Cache-Control'));
++    }
++
++    /** @return array<string, string> */
++    private function signedHeaders(string $body): array
++    {
++        $timestamp = $this->clock->now()->getTimestamp();
++        $v1 = hash_hmac('sha256', $timestamp . '.' . $body, self::SECRET);
++
++        return $this->transformHeadersToServerVars([
++            VerifySignature::HEADER => "t={$timestamp},v1={$v1}",
++        ]);
++    }
++}
+diff --git a/tests/PlatformMaintenanceTest.php b/tests/PlatformMaintenanceTest.php
+new file mode 100644
+index 0000000..80241be
+--- /dev/null
++++ b/tests/PlatformMaintenanceTest.php
+@@ -0,0 +1,151 @@
++<?php
++
++declare(strict_types=1);
++
++namespace AllSystems\Laravel\Tests;
++
++use AllSystems\Laravel\PlatformMaintenance;
++use DateTimeImmutable;
++use Illuminate\Contracts\Cache\Factory as CacheFactory;
++use Illuminate\Foundation\Application;
++use Illuminate\Support\Facades\Cache;
++use Illuminate\Support\Facades\Log;
++use Mockery;
++use Mockery\LegacyMockInterface;
++use Psr\Clock\ClockInterface;
++use Symfony\Component\Clock\MockClock;
++
++final class PlatformMaintenanceTest extends TestCase
++{
++    private PlatformMaintenance $maintenance;
++
++    private LegacyMockInterface $log;
++
++    protected function setUp(): void
++    {
++        parent::setUp();
++
++        $this->log = Log::spy();
++        $this->clock = new MockClock(new DateTimeImmutable('2026-10-25 12:00:00'));
++        $this->application()->instance(ClockInterface::class, $this->clock);
++        $this->maintenance = $this->application()->make(PlatformMaintenance::class);
++    }
++
++    public function testInactiveByDefault(): void
++    {
++        self::assertFalse($this->maintenance->isActive());
++    }
++
++    public function testStartActivatesTheWindow(): void
++    {
++        self::assertSame('activated', $this->maintenance->start('w-1'));
++        self::assertTrue($this->maintenance->isActive());
++    }
++
++    /** A redelivered `started` must not push the safety expiry out. */
++    public function testTheSameIdTwiceIsANoopAndKeepsTheOriginalExpiry(): void
++    {
++        $this->maintenance->start('w-1');
++        $this->clock->modify('+20 minutes');
++
++        self::assertSame('noop', $this->maintenance->start('w-1'));
++
++        $this->clock->modify('+10 minutes');
++        self::assertFalse($this->maintenance->isActive(), 'The redelivery extended the window.');
++    }
++
++    public function testADifferentIdReplacesTheWindow(): void
++    {
++        $this->maintenance->start('w-1');
++
++        self::assertSame('activated', $this->maintenance->start('w-2'));
++        self::assertSame('noop', $this->maintenance->end('w-1'));
++        self::assertTrue($this->maintenance->isActive());
++        self::assertSame('deactivated', $this->maintenance->end('w-2'));
++        self::assertFalse($this->maintenance->isActive());
++    }
++
++    public function testEndWithTheActiveIdDeactivates(): void
++    {
++        $this->maintenance->start('w-1');
++
++        self::assertSame('deactivated', $this->maintenance->end('w-1'));
++        self::assertFalse($this->maintenance->isActive());
++    }
++
++    public function testEndWithAnotherIdLeavesTheWindowOpen(): void
++    {
++        $this->maintenance->start('w-1');
++
++        self::assertSame('noop', $this->maintenance->end('w-other'));
++        self::assertTrue($this->maintenance->isActive());
++    }
++
++    public function testEndWhileInactiveIsANoop(): void
++    {
++        self::assertSame('noop', $this->maintenance->end('w-1'));
++    }
++
++    public function testTheWindowExpiresAfterMaxMinutesWithOneWarning(): void
++    {
++        $this->maintenance->start('w-1');
++        $this->clock->modify('+29 minutes');
++        self::assertTrue($this->maintenance->isActive());
++
++        $this->clock->modify('+1 minute');
++        self::assertFalse($this->maintenance->isActive());
++        // Forgotten on expiry: a second check finds nothing, so nothing more is logged.
++        self::assertFalse($this->maintenance->isActive());
++        self::assertSame('noop', $this->maintenance->end('w-1'));
++
++        $this->log->shouldHaveReceived('warning')->once()->withArgs(
++            static fn (string $message, array $context): bool => $message === 'platform_maintenance.expired'
++                && $context['id'] === 'w-1'
++                && $context['started_at'] === '2026-10-25T12:00:00+00:00',
++        );
++    }
++
++    public function testMaxMinutesComesFromConfig(): void
++    {
++        config(['allsystems.max_minutes' => 5]);
++        $this->maintenance->start('w-1');
++
++        $this->clock->modify('+4 minutes');
++        self::assertTrue($this->maintenance->isActive());
++        $this->clock->modify('+1 minute');
++        self::assertFalse($this->maintenance->isActive());
++    }
++
++    public function testTheFlagLivesInTheDefaultStore(): void
++    {
++        $this->maintenance->start('w-1');
++        self::assertNotNull(Cache::store()->get('allsystems:platform-maintenance'));
++
++        $this->maintenance->end('w-1');
++        self::assertNull(Cache::store()->get('allsystems:platform-maintenance'));
++    }
++
++    /** Laravel's own down-mode store must not route the per-request check to the database. */
++    public function testTheMaintenanceStoreConfigIsIgnored(): void
++    {
++        config(['app.maintenance.store' => 'database']);
++        $factory = Mockery::mock(CacheFactory::class);
++        $factory->shouldReceive('store')
++            ->withArgs(static fn (?string $name = null): bool => $name === null)
++            ->atLeast()->once()
++            ->andReturn(Cache::store('array'))
++        ;
++        $this->application()->instance(CacheFactory::class, $factory);
++        $maintenance = $this->application()->make(PlatformMaintenance::class);
++
++        self::assertSame('activated', $maintenance->start('w-1'));
++        self::assertTrue($maintenance->isActive());
++    }
++
++    private function application(): Application
++    {
++        self::assertNotNull($this->app);
++
++        return $this->app;
++    }
++}
+diff --git a/tests/ServiceProviderTest.php b/tests/ServiceProviderTest.php
+index 2278941..5b78927 100644
+--- a/tests/ServiceProviderTest.php
++++ b/tests/ServiceProviderTest.php
+@@ -1,25 +1,28 @@
+ <?php
+ 
+ declare(strict_types=1);
+ 
+ namespace AllSystems\Laravel\Tests;
+ 
+ use AllSystems\Laravel\Http\Middleware\VerifySignature;
++use AllSystems\Laravel\SystemClock;
+ use Illuminate\Contracts\Config\Repository as ConfigRepository;
+ use Illuminate\Contracts\Foundation\MaintenanceMode;
+ use Illuminate\Contracts\Http\Kernel as HttpKernelContract;
+ use Illuminate\Foundation\Application;
+ use Illuminate\Foundation\Http\Kernel as FoundationHttpKernel;
+ use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance;
+ use Illuminate\Routing\Route as RoutingRoute;
+ use Illuminate\Support\Facades\Route;
++use Psr\Clock\ClockInterface;
++use Symfony\Component\Clock\MockClock;
+ 
+ use function config;
+ 
+ final class ServiceProviderTest extends TestCase
+ {
+     protected function tearDown(): void
+     {
+         // The file maintenance driver writes real state to disk; activate()
+         // in the exemption test must not leak "down" into later tests.
+         $app = $this->app;
+@@ -28,20 +31,34 @@ final class ServiceProviderTest extends TestCase
+             $maintenanceMode = $app->make(MaintenanceMode::class);
+ 
+             if ($maintenanceMode->active()) {
+                 $maintenanceMode->deactivate();
+             }
+         }
+ 
+         parent::tearDown();
+     }
+ 
++    /** @return list<class-string> */
++    protected function getPackageProviders($app): array
++    {
++        // Registers first, as an app's own provider would, so its binding is already in place.
++        return $this->name() === 'testAnAppBindingOfTheClockWins'
++            ? [Doubles\MockClockProvider::class, ...parent::getPackageProviders($app)]
++            : parent::getPackageProviders($app);
++    }
++
++    protected function mocksTheClock(): bool
++    {
++        return $this->name() !== 'testTheClockDefaultsToTheSystemClock';
++    }
++
+     protected function defineEnvironment($app): void
+     {
+         parent::defineEnvironment($app);
+ 
+         assert($app instanceof Application);
+ 
+         // Only the path-override test needs a non-default path; every other
+         // test relies on the documented default staying in effect.
+         if ($this->name() === 'testConsumerPathOverrideMovesTheRoute') {
+             $app->make(ConfigRepository::class)->set('allsystems.path', 'custom/hook');
+@@ -49,33 +66,53 @@ final class ServiceProviderTest extends TestCase
+ 
+         if ($this->name() === 'testEmptyConfiguredPathFallsBackToTheDefaultAndDoesNotExemptTheHomePage') {
+             $app->make(ConfigRepository::class)->set('allsystems.path', '');
+         }
+ 
+         if ($this->name() === 'testWildcardConfiguredPathFallsBackToTheDefaultAndDoesNotExemptTheHomePage') {
+             $app->make(ConfigRepository::class)->set('allsystems.path', '*');
+         }
+     }
+ 
++    public function testTheClockDefaultsToTheSystemClock(): void
++    {
++        self::assertInstanceOf(SystemClock::class, $this->app?->make(ClockInterface::class));
++    }
++
++    public function testAnAppBindingOfTheClockWins(): void
++    {
++        self::assertInstanceOf(MockClock::class, $this->app?->make(ClockInterface::class));
++    }
++
+     public function testConfigMergesWithTheDocumentedDefaults(): void
+     {
+-        self::assertSame('allsystems/webhook', config('allsystems.path'));
++        self::assertSame('webhooks/allsystems', config('allsystems.path'));
+         self::assertSame(300, config('allsystems.tolerance'));
+-        self::assertTrue(config('allsystems.maintenance.enabled'));
++        self::assertSame('allsystems:platform-maintenance', config('allsystems.cache_key'));
++        self::assertSame(30, config('allsystems.max_minutes'));
++        self::assertSame(60, config('allsystems.retry_after'));
++        self::assertSame(['up'], config('allsystems.except'));
++        self::assertSame('allsystems::maintenance', config('allsystems.view'));
++        self::assertSame("We're doing some scheduled maintenance. Please try again in a minute or two.", config('allsystems.json_detail'));
++    }
++
++    public function testTheBundledMaintenanceViewIsRegistered(): void
++    {
++        self::assertTrue(view()->exists('allsystems::maintenance'));
+     }
+ 
+     public function testConsumerPathOverrideMovesTheRoute(): void
+     {
+-        $this->call('POST', '/custom/hook', [], [], [], $this->signedHeaders('[]'), '[]')
++        $this->call('POST', '/custom/hook', [], [], [], $this->signedHeaders('{"event":"ping"}'), '{"event":"ping"}')
+             ->assertOk()
+         ;
+-        $this->postJson('/allsystems/webhook')->assertNotFound();
++        $this->postJson('/webhooks/allsystems')->assertNotFound();
+     }
+ 
+     public function testTheRouteIsNamedAndCarriesOnlyVerifySignature(): void
+     {
+         $route = Route::getRoutes()->getByName('allsystems.webhook');
+ 
+         self::assertInstanceOf(RoutingRoute::class, $route);
+ 
+         self::assertSame(['AllSystems\Laravel\Http\Middleware\VerifySignature'], $route->gatherMiddleware());
+     }
+@@ -92,91 +129,91 @@ final class ServiceProviderTest extends TestCase
+ 
+         $kernel = $app->make(HttpKernelContract::class);
+         assert($kernel instanceof FoundationHttpKernel);
+         $kernel->pushMiddleware(PreventRequestsDuringMaintenance::class);
+ 
+         $app->make(MaintenanceMode::class)->activate([
+             'except' => [],
+             'status' => 503,
+         ]);
+ 
+-        $this->call('POST', '/allsystems/webhook', [], [], [], $this->signedHeaders('[]'), '[]')
++        $this->call('POST', '/webhooks/allsystems', [], [], [], $this->signedHeaders('{"event":"ping"}'), '{"event":"ping"}')
+             ->assertOk()
+         ;
+         $this->get('/')->assertServiceUnavailable();
+     }
+ 
+     /**
+      * I2: an empty configured path (unset, blank `.env` value, or a
+      * config:cache without publishing) must fall back to the documented
+      * default rather than relocating the route to the site root and
+      * exempting it from maintenance mode.
+      */
+     public function testEmptyConfiguredPathFallsBackToTheDefaultAndDoesNotExemptTheHomePage(): void
+     {
+-        self::assertSame('allsystems/webhook', config('allsystems.path'));
++        self::assertSame('webhooks/allsystems', config('allsystems.path'));
+ 
+         $app = $this->app;
+         assert($app !== null);
+ 
+         $kernel = $app->make(HttpKernelContract::class);
+         assert($kernel instanceof FoundationHttpKernel);
+         $kernel->pushMiddleware(PreventRequestsDuringMaintenance::class);
+ 
+         $app->make(MaintenanceMode::class)->activate(['except' => [], 'status' => 503]);
+ 
+-        $this->call('POST', '/allsystems/webhook', [], [], [], $this->signedHeaders('[]'), '[]')
++        $this->call('POST', '/webhooks/allsystems', [], [], [], $this->signedHeaders('{"event":"ping"}'), '{"event":"ping"}')
+             ->assertOk()
+         ;
+         $this->get('/')->assertServiceUnavailable();
+     }
+ 
+     /**
+      * I2: a wildcarded path would hand PreventRequestsDuringMaintenance::except
+      * the whole app; it must be rejected the same way an empty path is.
+      */
+     public function testWildcardConfiguredPathFallsBackToTheDefaultAndDoesNotExemptTheHomePage(): void
+     {
+-        self::assertSame('allsystems/webhook', config('allsystems.path'));
++        self::assertSame('webhooks/allsystems', config('allsystems.path'));
+ 
+         $app = $this->app;
+         assert($app !== null);
+ 
+         $kernel = $app->make(HttpKernelContract::class);
+         assert($kernel instanceof FoundationHttpKernel);
+         $kernel->pushMiddleware(PreventRequestsDuringMaintenance::class);
+ 
+         $app->make(MaintenanceMode::class)->activate(['except' => [], 'status' => 503]);
+ 
+-        $this->call('POST', '/allsystems/webhook', [], [], [], $this->signedHeaders('[]'), '[]')
++        $this->call('POST', '/webhooks/allsystems', [], [], [], $this->signedHeaders('{"event":"ping"}'), '{"event":"ping"}')
+             ->assertOk()
+         ;
+         $this->get('/')->assertServiceUnavailable();
+     }
+ 
+     /**
+      * I2: exactly one entry — the second, '/'-prefixed variant that used to
+      * be registered was redundant for a normal path (inExceptArray() trims
+      * slashes off each pattern itself) and actively wrong for the empty-path
+      * case (it matched the site root).
+      */
+     public function testExemptedPathsListHasExactlyOneEntryForANormalConfiguredPath(): void
+     {
+         $app = $this->app;
+         assert($app !== null);
+ 
+         $exemptions = $app->make(PreventRequestsDuringMaintenance::class);
+ 
+-        self::assertSame(['allsystems/webhook'], $exemptions->getExcludedPaths());
++        self::assertSame(['webhooks/allsystems'], $exemptions->getExcludedPaths());
+     }
+ 
+     /** @return array<string, string> */
+     private function signedHeaders(string $body): array
+     {
+-        $timestamp = time();
++        $timestamp = $this->clock->now()->getTimestamp();
+         $v1 = hash_hmac('sha256', $timestamp . '.' . $body, self::SECRET);
+ 
+         return $this->transformHeadersToServerVars([
+             VerifySignature::HEADER => "t={$timestamp},v1={$v1}",
+         ]);
+     }
+ }
+diff --git a/tests/SyncMaintenanceModeTest.php b/tests/SyncMaintenanceModeTest.php
+deleted file mode 100644
+index 92f4db0..0000000
+--- a/tests/SyncMaintenanceModeTest.php
++++ /dev/null
+@@ -1,395 +0,0 @@
+-<?php
+-
+-declare(strict_types=1);
+-
+-namespace AllSystems\Laravel\Tests;
+-
+-use AllSystems\Laravel\Events\MaintenanceEnded;
+-use AllSystems\Laravel\Events\MaintenanceStarted;
+-use AllSystems\Laravel\Http\Middleware\VerifySignature;
+-use AllSystems\Laravel\Listeners\SyncMaintenanceMode;
+-use AllSystems\Laravel\MaintenancePayload;
+-use AllSystems\Laravel\SyncResult;
+-use AllSystems\Laravel\Tests\Doubles\FakeMaintenanceMode;
+-use DateTimeImmutable;
+-use Illuminate\Contracts\Events\Dispatcher;
+-use Illuminate\Contracts\Foundation\MaintenanceMode;
+-use Illuminate\Contracts\Http\Kernel as HttpKernelContract;
+-use Illuminate\Foundation\Http\Kernel as FoundationHttpKernel;
+-use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance;
+-use Illuminate\Support\Facades\Event;
+-use Illuminate\View\Factory as ViewFactory;
+-
+-use function config;
+-
+-/**
+- * Drives SyncMaintenanceMode directly through the event dispatcher, with a
+- * FakeMaintenanceMode standing in for the real driver, so every assertion is
+- * about what the listener told MaintenanceMode to do — not about a file on
+- * disk. The id-guard tests are the reason this package exists: see the class
+- * docblock on SyncMaintenanceMode.
+- */
+-final class SyncMaintenanceModeTest extends TestCase
+-{
+-    private const PATH = '/allsystems/webhook';
+-
+-    protected function defineEnvironment($app): void
+-    {
+-        parent::defineEnvironment($app);
+-
+-        if ($this->name() === 'testMaintenanceDisabledListenerIsNotRegisteredButEventsStillDispatchAndWebhookStillReturns200') {
+-            config(['allsystems.maintenance.enabled' => false]);
+-        }
+-    }
+-
+-    protected function tearDown(): void
+-    {
+-        // The "end to end" test drives the real file-backed MaintenanceMode
+-        // to prove the B2 exemption; leaving it active would leak "down" into
+-        // every test that runs after it, in this class and beyond.
+-        $app = $this->app;
+-
+-        if ($app !== null) {
+-            $maintenanceMode = $app->make(MaintenanceMode::class);
+-
+-            if ($maintenanceMode->active()) {
+-                $maintenanceMode->deactivate();
+-            }
+-        }
+-
+-        parent::tearDown();
+-    }
+-
+-    public function testStartedColdActivatesWithTheDocumentedDefaultsAndSetsActionActivated(): void
+-    {
+-        $fake = $this->bindFake();
+-        $payload = $this->payload('window-1', (new DateTimeImmutable())->modify('+1800 seconds'));
+-
+-        $this->dispatch(new MaintenanceStarted($payload));
+-
+-        self::assertCount(1, $fake->activations);
+-        $activation = $fake->activations[0];
+-
+-        self::assertSame(['allsystems/webhook'], $activation['except']);
+-        self::assertNull($activation['redirect']);
+-        self::assertIsInt($activation['retry']);
+-        self::assertGreaterThanOrEqual(1795, $activation['retry']);
+-        self::assertLessThanOrEqual(1800, $activation['retry']);
+-        self::assertNull($activation['refresh']);
+-        self::assertNull($activation['secret']);
+-        self::assertSame(503, $activation['status']);
+-        self::assertNull($activation['template']);
+-        self::assertSame('window-1', $activation[SyncMaintenanceMode::ID_KEY]);
+-
+-        self::assertSame('activated', $this->syncResult()->action);
+-    }
+-
+-    public function testStartedWithConfigSetPassesThroughSecretRedirectRefreshAndRendersTheTemplate(): void
+-    {
+-        config([
+-            'allsystems.maintenance.secret' => 'bypass-phrase',
+-            'allsystems.maintenance.redirect' => '/status',
+-            'allsystems.maintenance.refresh' => 30,
+-            'allsystems.maintenance.template' => 'maintenance-window',
+-        ]);
+-
+-        $app = $this->app;
+-        assert($app !== null);
+-        $app->make(ViewFactory::class)->addLocation(__DIR__ . '/views');
+-
+-        $fake = $this->bindFake();
+-        $payload = $this->payload('window-2', (new DateTimeImmutable())->modify('+1800 seconds'));
+-
+-        $this->dispatch(new MaintenanceStarted($payload));
+-
+-        $activation = $fake->activations[0];
+-
+-        self::assertSame('bypass-phrase', $activation['secret']);
+-        self::assertSame('/status', $activation['redirect']);
+-        self::assertSame(30, $activation['refresh']);
+-
+-        $template = $activation['template'];
+-        $retry = $activation['retry'];
+-        self::assertIsString($template);
+-        self::assertIsInt($retry);
+-        self::assertStringContainsString('Down for maintenance', $template);
+-        self::assertStringContainsString((string) $retry, $template);
+-        self::assertStringNotContainsString('maintenance-window', $template);
+-    }
+-
+-    /**
+-     * I3: the produced payload's `except` must mirror what the provider
+-     * registered with PreventRequestsDuringMaintenance, not an empty array —
+-     * otherwise a leftover storage/framework/maintenance.php stub from an
+-     * earlier `artisan down` can permanently swallow the `ended` webhook.
+-     */
+-    public function testStartedActivatesWithANonEmptyExceptListContainingTheWebhookPath(): void
+-    {
+-        config(['allsystems.maintenance.template' => 'maintenance-window']);
+-
+-        $app = $this->app;
+-        assert($app !== null);
+-        $app->make(ViewFactory::class)->addLocation(__DIR__ . '/views');
+-
+-        $fake = $this->bindFake();
+-        $payload = $this->payload('window-13', (new DateTimeImmutable())->modify('+1800 seconds'));
+-
+-        $this->dispatch(new MaintenanceStarted($payload));
+-
+-        $except = $fake->activations[0]['except'];
+-        self::assertIsArray($except);
+-        self::assertNotEmpty($except);
+-        self::assertContains('allsystems/webhook', $except);
+-    }
+-
+-    public function testStartedRetryFloorsAtSixtySecondsWhenTheWindowHasAlreadyEnded(): void
+-    {
+-        $fake = $this->bindFake();
+-        $payload = $this->payload('window-3', (new DateTimeImmutable())->modify('-60 seconds'));
+-
+-        $this->dispatch(new MaintenanceStarted($payload));
+-
+-        self::assertSame(60, $fake->activations[0]['retry']);
+-    }
+-
+-    /**
+-     * M3: a non-numeric refresh value must produce `null`, not `0` — a
+-     * `Refresh: 0` header tells browsers to reload immediately, in a loop,
+-     * for the whole maintenance window.
+-     */
+-    public function testStartedWithNonNumericRefreshConfigProducesNullNotZero(): void
+-    {
+-        config(['allsystems.maintenance.refresh' => 'not-a-number']);
+-
+-        $fake = $this->bindFake();
+-        $payload = $this->payload('window-14', (new DateTimeImmutable())->modify('+1800 seconds'));
+-
+-        $this->dispatch(new MaintenanceStarted($payload));
+-
+-        self::assertNull($fake->activations[0]['refresh']);
+-    }
+-
+-    public function testStartedAlreadyActiveWithTheSameIdDoesNotReactivate(): void
+-    {
+-        $fake = $this->bindFake();
+-        $fake->activate([SyncMaintenanceMode::ID_KEY => 'window-4', 'except' => []]);
+-
+-        $this->dispatch(new MaintenanceStarted($this->payload('window-4')));
+-
+-        self::assertCount(1, $fake->activations);
+-        self::assertSame('noop', $this->syncResult()->action);
+-    }
+-
+-    public function testStartedAlreadyActiveWithADifferentIdSupersedesIt(): void
+-    {
+-        $fake = $this->bindFake();
+-        $fake->activate([SyncMaintenanceMode::ID_KEY => 'window-5a', 'except' => []]);
+-
+-        $this->dispatch(new MaintenanceStarted($this->payload('window-5b')));
+-
+-        self::assertCount(2, $fake->activations);
+-        self::assertSame('window-5b', $fake->activations[1][SyncMaintenanceMode::ID_KEY]);
+-        self::assertSame('activated', $this->syncResult()->action);
+-    }
+-
+-    public function testEndedOursDeactivatesAndSetsActionDeactivated(): void
+-    {
+-        $fake = $this->bindFake();
+-        $fake->activate([SyncMaintenanceMode::ID_KEY => 'window-6', 'except' => []]);
+-
+-        $this->dispatch(new MaintenanceEnded($this->payload('window-6')));
+-
+-        self::assertSame(1, $fake->deactivateCalls);
+-        self::assertFalse($fake->active());
+-        self::assertSame('deactivated', $this->syncResult()->action);
+-    }
+-
+-    public function testEndedWhenNotActiveDoesNotDeactivate(): void
+-    {
+-        $fake = $this->bindFake();
+-
+-        $this->dispatch(new MaintenanceEnded($this->payload('window-7')));
+-
+-        self::assertSame(0, $fake->deactivateCalls);
+-        self::assertSame('noop', $this->syncResult()->action);
+-    }
+-
+-    /**
+-     * This is the test the package exists to keep passing. A hand-run
+-     * `artisan down` has no allsystems_maintenance_id in its data array at
+-     * all — see the shape produced by DownCommand::getDownFilePayload().
+-     */
+-    public function testEndedDoesNotLiftAHandRunArtisanDown(): void
+-    {
+-        $fake = $this->bindFake();
+-        $fake->activate([
+-            'except' => [],
+-            'redirect' => null,
+-            'retry' => 60,
+-            'refresh' => null,
+-            'secret' => null,
+-            'status' => 503,
+-            'template' => null,
+-        ]);
+-
+-        $this->dispatch(new MaintenanceEnded($this->payload('window-8')));
+-
+-        self::assertSame(0, $fake->deactivateCalls, 'A hand-run artisan down must never be lifted by an AllSystems window ending.');
+-        self::assertSame('noop', $this->syncResult()->action);
+-    }
+-
+-    /**
+-     * The composed case C1 fixes: a foreign maintenance mode (no
+-     * allsystems_maintenance_id at all) is active when `started` arrives.
+-     * `started` must not take it over — and because it doesn't, the matching
+-     * `ended` has nothing of ours to lift either.
+-     */
+-    public function testStartedDoesNotTakeOverAForeignMaintenanceModeAndSubsequentEndedDoesNotLiftIt(): void
+-    {
+-        $fake = $this->bindFake();
+-        $fake->activate([
+-            'except' => [],
+-            'redirect' => null,
+-            'retry' => 60,
+-            'refresh' => null,
+-            'secret' => 'let-me-in',
+-            'status' => 503,
+-            'template' => null,
+-        ]);
+-
+-        $this->dispatch(new MaintenanceStarted($this->payload('window-12')));
+-
+-        self::assertCount(1, $fake->activations, 'started must not call activate() over a foreign maintenance mode.');
+-        self::assertSame('noop', $this->syncResult()->action);
+-        self::assertTrue($fake->active());
+-
+-        $this->dispatch(new MaintenanceEnded($this->payload('window-12')));
+-
+-        self::assertSame(0, $fake->deactivateCalls, 'A foreign maintenance mode must never be lifted by AllSystems.');
+-        self::assertTrue($fake->active());
+-        self::assertSame('noop', $this->syncResult()->action);
+-    }
+-
+-    public function testEndedDoesNotLiftADifferentWindowsId(): void
+-    {
+-        $fake = $this->bindFake();
+-        $fake->activate([SyncMaintenanceMode::ID_KEY => 'window-9a', 'except' => []]);
+-
+-        $this->dispatch(new MaintenanceEnded($this->payload('window-9b')));
+-
+-        self::assertSame(0, $fake->deactivateCalls);
+-        self::assertSame('noop', $this->syncResult()->action);
+-    }
+-
+-    public function testMaintenanceDisabledListenerIsNotRegisteredButEventsStillDispatchAndWebhookStillReturns200(): void
+-    {
+-        $fake = $this->bindFake();
+-
+-        $dispatched = false;
+-        Event::listen(MaintenanceStarted::class, function () use (&$dispatched): void {
+-            $dispatched = true;
+-        });
+-
+-        $body = $this->maintenanceBody('window-10');
+-
+-        $this->call('POST', self::PATH, [], [], [], $this->signedHeaders('maintenance.started', $body), $body)
+-            ->assertOk()
+-            ->assertJson(['ok' => true, 'action' => 'noop'])
+-        ;
+-
+-        self::assertTrue($dispatched, 'The event must still dispatch even when the listener is not registered.');
+-        self::assertSame([], $fake->activations);
+-        self::assertSame(0, $fake->deactivateCalls);
+-    }
+-
+-    /**
+-     * The real, file-backed MaintenanceMode — not the fake — driven over real
+-     * signed HTTP, proving the whole chain: activate on `started`, the app
+-     * really is down, the `ended` webhook is reachable anyway (B2's
+-     * exemption), and it lifts the *same* window's maintenance mode.
+-     */
+-    public function testEndToEndSignedStartedThenEndedAppliesAndLiftsMaintenanceMode(): void
+-    {
+-        $app = $this->app;
+-        assert($app !== null);
+-        $kernel = $app->make(HttpKernelContract::class);
+-        assert($kernel instanceof FoundationHttpKernel);
+-        $kernel->pushMiddleware(PreventRequestsDuringMaintenance::class);
+-
+-        $body = $this->maintenanceBody('window-11');
+-
+-        $this->call('POST', self::PATH, [], [], [], $this->signedHeaders('maintenance.started', $body), $body)
+-            ->assertOk()
+-            ->assertJson(['ok' => true, 'action' => 'activated'])
+-        ;
+-
+-        $this->get('/')->assertServiceUnavailable();
+-
+-        $this->call('POST', self::PATH, [], [], [], $this->signedHeaders('maintenance.ended', $body), $body)
+-            ->assertOk()
+-            ->assertJson(['ok' => true, 'action' => 'deactivated'])
+-        ;
+-
+-        self::assertFalse($app->make(MaintenanceMode::class)->active());
+-    }
+-
+-    private function bindFake(): FakeMaintenanceMode
+-    {
+-        $fake = new FakeMaintenanceMode();
+-
+-        $app = $this->app;
+-        assert($app !== null);
+-        $app->instance(MaintenanceMode::class, $fake);
+-
+-        return $fake;
+-    }
+-
+-    private function syncResult(): SyncResult
+-    {
+-        $app = $this->app;
+-        assert($app !== null);
+-
+-        return $app->make(SyncResult::class);
+-    }
+-
+-    private function dispatch(object $event): void
+-    {
+-        $app = $this->app;
+-        assert($app !== null);
+-        $app->make(Dispatcher::class)->dispatch($event);
+-    }
+-
+-    private function payload(string $id, ?DateTimeImmutable $endsAt = null): MaintenancePayload
+-    {
+-        $now = new DateTimeImmutable();
+-
+-        return new MaintenancePayload(
+-            id: $id,
+-            title: 'Database upgrade',
+-            message: 'Upgrading PostgreSQL.',
+-            startsAt: $now,
+-            endsAt: $endsAt ?? $now->modify('+1800 seconds'),
+-            components: [],
+-        );
+-    }
+-
+-    private function maintenanceBody(string $id): string
+-    {
+-        return sprintf(
+-            '{"id":"%s","title":"Database upgrade","message":"Upgrading PostgreSQL.","starts_at":"2026-08-20T01:00:00Z","ends_at":"2026-08-20T01:30:00Z","components":[]}',
+-            $id,
+-        );
+-    }
+-
+-    /** @return array<string, string> */
+-    private function signedHeaders(string $event, string $body): array
+-    {
+-        $timestamp = time();
+-        $v1 = hash_hmac('sha256', $timestamp . '.' . $body, self::SECRET);
+-
+-        return $this->transformHeadersToServerVars([
+-            VerifySignature::HEADER => "t={$timestamp},v1={$v1}",
+-            'X-AllSystems-Event' => $event,
+-        ]);
+-    }
+-}
+diff --git a/tests/TestCase.php b/tests/TestCase.php
+index f39c0da..33a1cd2 100644
+--- a/tests/TestCase.php
++++ b/tests/TestCase.php
+@@ -2,25 +2,31 @@
+ 
+ declare(strict_types=1);
+ 
+ namespace AllSystems\Laravel\Tests;
+ 
+ use AllSystems\Laravel\AllSystemsServiceProvider;
+ use Illuminate\Contracts\Config\Repository as ConfigRepository;
+ use Illuminate\Foundation\Application;
+ use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance;
+ use Orchestra\Testbench\TestCase as OrchestraTestCase;
++use Psr\Clock\ClockInterface;
++use Symfony\Component\Clock\MockClock;
+ 
+ abstract class TestCase extends OrchestraTestCase
+ {
+     protected const SECRET = 'whsec_test_31d4a1f7c0b84e6fa9d2c5e8b7043f16';
+ 
++    protected const NOW = 1787000000;
++
++    protected MockClock $clock;
++
+     protected function setUp(): void
+     {
+         // Static state on a framework class survives between tests in the same
+         // process; without this, one test's registered exemption leaks into the
+         // next and the assertion that it was registered passes vacuously.
+         PreventRequestsDuringMaintenance::flushState();
+ 
+         parent::setUp();
+     }
+ 
+@@ -30,12 +36,24 @@ abstract class TestCase extends OrchestraTestCase
+         return [AllSystemsServiceProvider::class];
+     }
+ 
+     protected function defineEnvironment($app): void
+     {
+         // Testbench's own signature leaves $app untyped; it is always an
+         // Application at the call site, just not statically provable here.
+         assert($app instanceof Application);
+ 
+         $app->make(ConfigRepository::class)->set('allsystems.secret', self::SECRET);
++
++        $this->clock = new MockClock('@' . self::NOW);
++
++        if ($this->mocksTheClock()) {
++            $app->instance(ClockInterface::class, $this->clock);
++        }
++    }
++
++    /** A test of the production clock default opts out. */
++    protected function mocksTheClock(): bool
++    {
++        return true;
+     }
+ }
+diff --git a/tests/VerifySignatureTest.php b/tests/VerifySignatureTest.php
+index 04423a7..e774beb 100644
+--- a/tests/VerifySignatureTest.php
++++ b/tests/VerifySignatureTest.php
+@@ -3,178 +3,182 @@
+ declare(strict_types=1);
+ 
+ namespace AllSystems\Laravel\Tests;
+ 
+ use AllSystems\Laravel\Http\Middleware\VerifySignature;
+ use Illuminate\Contracts\Config\Repository as ConfigRepository;
+ use Illuminate\Foundation\Application;
+ 
+ /**
+  * Drives real HTTP through the registered route, exercising VerifySignature
+- * as the only thing between an anonymous request and the (stub)
++ * as the only thing between an anonymous request and the
+  * WebhookController — which is exactly the boundary it exists to guard.
+  */
+ final class VerifySignatureTest extends TestCase
+ {
+-    private const PATH = '/allsystems/webhook';
++    private const PATH = '/webhooks/allsystems';
+ 
+     protected function defineEnvironment($app): void
+     {
+         parent::defineEnvironment($app);
+ 
+         assert($app instanceof Application);
+ 
+         // Only the "secret not configured" test needs the secret unset;
+         // every other test relies on TestCase's default being in effect.
+         if ($this->name() === 'testUnsetSecretRejectsEvenAValidSignature') {
+             $app->make(ConfigRepository::class)->set('allsystems.secret', null);
+         }
+     }
+ 
+     public function testACorrectlySignedRequestReachesTheController(): void
+     {
+         $body = '{"event":"ping"}';
+-        $timestamp = time();
++        $timestamp = $this->clock->now()->getTimestamp();
+ 
+         $this->call('POST', self::PATH, [], [], [], $this->signedHeaders($timestamp, $body), $body)
+             ->assertOk()
+         ;
+     }
+ 
+     public function testNoHeaderIsRejected(): void
+     {
+         $this->call('POST', self::PATH, [], [], [], $this->transformHeadersToServerVars([]), '{}')
+             ->assertUnauthorized()
++            ->assertExactJson(['error' => 'Invalid signature'])
+         ;
+     }
+ 
+     public function testHeaderWithOnlyTimestampIsRejected(): void
+     {
+         $headers = $this->transformHeadersToServerVars([
+-            'X-AllSystems-Signature' => 't=' . time(),
++            'X-AllSystems-Signature' => 't=' . $this->clock->now()->getTimestamp(),
+         ]);
+ 
+         $this->call('POST', self::PATH, [], [], [], $headers, '{}')
+             ->assertUnauthorized()
++            ->assertExactJson(['error' => 'Invalid signature'])
+         ;
+     }
+ 
+     public function testHeaderWithOnlyV1IsRejected(): void
+     {
+         $headers = $this->transformHeadersToServerVars([
+             'X-AllSystems-Signature' => 'v1=' . str_repeat('a', 64),
+         ]);
+ 
+         $this->call('POST', self::PATH, [], [], [], $headers, '{}')
+             ->assertUnauthorized()
++            ->assertExactJson(['error' => 'Invalid signature'])
+         ;
+     }
+ 
+     public function testV1ThatIsNotSixtyFourHexCharsIsRejected(): void
+     {
+         $headers = $this->transformHeadersToServerVars([
+-            'X-AllSystems-Signature' => 't=' . time() . ',v1=deadbeef',
++            'X-AllSystems-Signature' => 't=' . $this->clock->now()->getTimestamp() . ',v1=deadbeef',
+         ]);
+ 
+         $this->call('POST', self::PATH, [], [], [], $headers, '{}')
+             ->assertUnauthorized()
++            ->assertExactJson(['error' => 'Invalid signature'])
+         ;
+     }
+ 
+     /**
+      * now - 301 is one second past the default 300s tolerance: stale.
+      */
+     public function testAStaleTimestampIsRejected(): void
+     {
+         $body = '{"event":"ping"}';
+-        $timestamp = time() - 301;
++        $timestamp = $this->clock->now()->getTimestamp() - 301;
+ 
+         $this->call('POST', self::PATH, [], [], [], $this->signedHeaders($timestamp, $body), $body)
+             ->assertUnauthorized()
++            ->assertExactJson(['error' => 'Invalid signature'])
+         ;
+     }
+ 
+     /**
+      * now + 301 is one second beyond tolerance in the other direction —
+      * abs() must reject a future timestamp exactly as it rejects a stale one.
+      */
+     public function testAFutureTimestampIsRejected(): void
+     {
+         $body = '{"event":"ping"}';
+-        $timestamp = time() + 301;
++        $timestamp = $this->clock->now()->getTimestamp() + 301;
+ 
+         $this->call('POST', self::PATH, [], [], [], $this->signedHeaders($timestamp, $body), $body)
+             ->assertUnauthorized()
++            ->assertExactJson(['error' => 'Invalid signature'])
+         ;
+     }
+ 
+     /**
+      * now - 299 is one second INSIDE the 300s tolerance: the boundary case
+      * that proves the check is abs(now - t) > tolerance (inclusive at the
+      * edge), not some off-by-one variant that would reject this too.
+      */
+     public function testNowMinus299PassesTheToleranceBoundary(): void
+     {
+         $body = '{"event":"ping"}';
+-        $timestamp = time() - 299;
++        $timestamp = $this->clock->now()->getTimestamp() - 299;
+ 
+         $this->call('POST', self::PATH, [], [], [], $this->signedHeaders($timestamp, $body), $body)
+             ->assertOk()
+         ;
+     }
+ 
+     public function testASignatureOverADifferentBodyIsRejected(): void
+     {
+-        $timestamp = time();
++        $timestamp = $this->clock->now()->getTimestamp();
+         $headers = $this->signedHeaders($timestamp, '{"event":"ping"}');
+ 
+         $this->call('POST', self::PATH, [], [], [], $headers, '{"event":"totally-different"}')
+             ->assertUnauthorized()
++            ->assertExactJson(['error' => 'Invalid signature'])
+         ;
+     }
+ 
+     public function testUnsetSecretRejectsEvenAValidSignature(): void
+     {
+         // The secret is unset via defineEnvironment() above for this test
+         // only. Sign with TestCase::SECRET anyway — a syntactically valid
+         // header — to prove the rejection is the missing config, not a
+         // malformed request.
+         $body = '{"event":"ping"}';
+-        $timestamp = time();
++        $timestamp = $this->clock->now()->getTimestamp();
+ 
+         $this->call('POST', self::PATH, [], [], [], $this->signedHeaders($timestamp, $body), $body)
+             ->assertUnauthorized()
++            ->assertExactJson(['error' => 'Invalid signature'])
+         ;
+     }
+ 
+     /**
+      * The re-encode trap: this body has non-canonical JSON spacing (extra
+      * space after each `:`). The signature is computed over these EXACT
+      * bytes. If the middleware ever decoded and re-encoded the body instead
+      * of hashing $request->getContent() verbatim, the digest it computed
+      * would differ from this one and the request would be wrongly rejected.
+      */
+     public function testNonCanonicalJsonSpacingStillVerifiesBecauseTheRawBodyIsSigned(): void
+     {
+         $body = '{"event": "ping", "application": {"id": "01920000-0000-7000-8000-00000000b001"}}';
+-        $timestamp = time();
++        $timestamp = $this->clock->now()->getTimestamp();
+         $headers = $this->signedHeaders($timestamp, $body);
+ 
+         $this->call('POST', self::PATH, [], [], [], $headers, $body)
+             ->assertOk()
+         ;
+     }
+ 
+     /** @return array<string, string> */
+     private function signedHeaders(int $timestamp, string $body): array
+     {
+         $v1 = hash_hmac('sha256', $timestamp . '.' . $body, self::SECRET);
+ 
+         return $this->transformHeadersToServerVars([
+             VerifySignature::HEADER => "t={$timestamp},v1={$v1}",
+-            // Every body signed in this file declares "event":"ping" (or no
+-            // event at all, for the requests VerifySignature itself rejects
+-            // before the controller's event/header cross-check ever runs).
+-            'X-AllSystems-Event' => 'ping',
+         ]);
+     }
+ }
+diff --git a/tests/WebhookControllerTest.php b/tests/WebhookControllerTest.php
+deleted file mode 100644
+index 62a0174..0000000
+--- a/tests/WebhookControllerTest.php
++++ /dev/null
+@@ -1,243 +0,0 @@
+-<?php
+-
+-declare(strict_types=1);
+-
+-namespace AllSystems\Laravel\Tests;
+-
+-use AllSystems\Laravel\Events\MaintenanceEnded;
+-use AllSystems\Laravel\Events\MaintenanceStarted;
+-use AllSystems\Laravel\Events\PingReceived;
+-use AllSystems\Laravel\Http\Middleware\VerifySignature;
+-use Illuminate\Support\Facades\Event;
+-
+-/**
+- * Drives real HTTP through the registered route with VerifySignature already
+- * satisfied, exercising the controller's own decode/dispatch/respond logic.
+- *
+- * Event::fake() is the "real event listener spy" the plan calls for: it
+- * intercepts the actual dispatcher, so a passing assertion here proves the
+- * controller called dispatch(), not merely that the response looked right.
+- */
+-final class WebhookControllerTest extends TestCase
+-{
+-    private const PATH = '/allsystems/webhook';
+-
+-    private const VALID_MAINTENANCE_BODY = '{"id":"01920000-0000-7000-8000-00000000a001","event":"maintenance.started","title":"Database upgrade","message":"Upgrading PostgreSQL.","starts_at":"2026-08-20T01:00:00Z","ends_at":"2026-08-20T01:30:00Z","components":[]}';
+-
+-    private const VALID_MAINTENANCE_ENDED_BODY = '{"id":"01920000-0000-7000-8000-00000000a001","event":"maintenance.ended","title":"Database upgrade","message":"Upgrading PostgreSQL.","starts_at":"2026-08-20T01:00:00Z","ends_at":"2026-08-20T01:30:00Z","components":[]}';
+-
+-    private const PING_BODY = '{"event":"ping","application":{"id":"01920000-0000-7000-8000-00000000b001","name":"Storefront"}}';
+-
+-    public function testSignedMaintenanceStartedDispatchesExactlyOneEventAndReturnsOk(): void
+-    {
+-        Event::fake();
+-
+-        $this->call(
+-            'POST',
+-            self::PATH,
+-            [],
+-            [],
+-            [],
+-            $this->signedHeaders('maintenance.started', self::VALID_MAINTENANCE_BODY),
+-            self::VALID_MAINTENANCE_BODY,
+-        )
+-            ->assertOk()
+-            ->assertJson(['ok' => true])
+-        ;
+-
+-        Event::assertDispatchedTimes(MaintenanceStarted::class, 1);
+-        Event::assertDispatched(
+-            MaintenanceStarted::class,
+-            static fn (MaintenanceStarted $event): bool => $event->payload->id === '01920000-0000-7000-8000-00000000a001',
+-        );
+-        Event::assertNotDispatched(MaintenanceEnded::class);
+-        Event::assertNotDispatched(PingReceived::class);
+-    }
+-
+-    public function testSignedMaintenanceEndedDispatchesExactlyOneEventAndReturnsOk(): void
+-    {
+-        Event::fake();
+-
+-        $this->call(
+-            'POST',
+-            self::PATH,
+-            [],
+-            [],
+-            [],
+-            $this->signedHeaders('maintenance.ended', self::VALID_MAINTENANCE_ENDED_BODY),
+-            self::VALID_MAINTENANCE_ENDED_BODY,
+-        )
+-            ->assertOk()
+-            ->assertJson(['ok' => true])
+-        ;
+-
+-        Event::assertDispatchedTimes(MaintenanceEnded::class, 1);
+-        Event::assertDispatched(
+-            MaintenanceEnded::class,
+-            static fn (MaintenanceEnded $event): bool => $event->payload->id === '01920000-0000-7000-8000-00000000a001',
+-        );
+-        Event::assertNotDispatched(MaintenanceStarted::class);
+-        Event::assertNotDispatched(PingReceived::class);
+-    }
+-
+-    public function testSignedPingDispatchesExactlyOnePingReceivedAndReturnsNoop(): void
+-    {
+-        Event::fake();
+-
+-        $response = $this->call(
+-            'POST',
+-            self::PATH,
+-            [],
+-            [],
+-            [],
+-            $this->signedHeaders('ping', self::PING_BODY),
+-            self::PING_BODY,
+-        );
+-
+-        $response->assertOk()->assertJson(['ok' => true, 'action' => 'noop']);
+-
+-        Event::assertDispatchedTimes(PingReceived::class, 1);
+-        Event::assertDispatched(
+-            PingReceived::class,
+-            static fn (PingReceived $event): bool => $event->applicationId === '01920000-0000-7000-8000-00000000b001'
+-                && $event->applicationName === 'Storefront',
+-        );
+-        Event::assertNotDispatched(MaintenanceStarted::class);
+-        Event::assertNotDispatched(MaintenanceEnded::class);
+-    }
+-
+-    public function testUnknownEventReturnsOkNoopAndDispatchesNothing(): void
+-    {
+-        Event::fake();
+-
+-        $body = '{"event":"something.unknown"}';
+-
+-        $this->call('POST', self::PATH, [], [], [], $this->signedHeaders('something.unknown', $body), $body)
+-            ->assertOk()
+-            ->assertJson(['ok' => true, 'action' => 'noop'])
+-        ;
+-
+-        $this->assertNoneOfOurEventsWereDispatched();
+-    }
+-
+-    public function testMalformedJsonBodyReturns400(): void
+-    {
+-        Event::fake();
+-
+-        $body = 'not-json';
+-
+-        $this->call('POST', self::PATH, [], [], [], $this->signedHeaders('maintenance.started', $body), $body)
+-            ->assertStatus(400)
+-        ;
+-
+-        $this->assertNoneOfOurEventsWereDispatched();
+-    }
+-
+-    public function testMaintenanceStartedMissingStartsAtReturns422AndDispatchesNothing(): void
+-    {
+-        Event::fake();
+-
+-        /** @var array<string, mixed> $decoded */
+-        $decoded = json_decode(self::VALID_MAINTENANCE_BODY, true, 512, JSON_THROW_ON_ERROR);
+-        unset($decoded['starts_at']);
+-        $body = json_encode($decoded, JSON_THROW_ON_ERROR);
+-
+-        $this->call('POST', self::PATH, [], [], [], $this->signedHeaders('maintenance.started', $body), $body)
+-            ->assertStatus(422)
+-        ;
+-
+-        $this->assertNoneOfOurEventsWereDispatched();
+-    }
+-
+-    public function testGetIsMethodNotAllowed(): void
+-    {
+-        $this->get(self::PATH)->assertStatus(405);
+-    }
+-
+-    /**
+-     * I1: the signature covers the body, not the X-AllSystems-Event header
+-     * that actually drives routing. Without the cross-check, a captured
+-     * `maintenance.started` delivery is byte-for-byte a valid
+-     * `maintenance.ended` with only the header flipped.
+-     */
+-    public function testFlippingTheEventHeaderOnASignedBodyIsRejected(): void
+-    {
+-        Event::fake();
+-
+-        $timestamp = time();
+-        $v1 = hash_hmac('sha256', $timestamp . '.' . self::VALID_MAINTENANCE_BODY, self::SECRET);
+-        $signature = "t={$timestamp},v1={$v1}";
+-
+-        $startedHeaders = $this->transformHeadersToServerVars([
+-            VerifySignature::HEADER => $signature,
+-            'X-AllSystems-Event' => 'maintenance.started',
+-        ]);
+-
+-        $this->call('POST', self::PATH, [], [], [], $startedHeaders, self::VALID_MAINTENANCE_BODY)
+-            ->assertOk()
+-            ->assertJson(['ok' => true])
+-        ;
+-
+-        $endedHeaders = $this->transformHeadersToServerVars([
+-            VerifySignature::HEADER => $signature,
+-            'X-AllSystems-Event' => 'maintenance.ended',
+-        ]);
+-
+-        $this->call('POST', self::PATH, [], [], [], $endedHeaders, self::VALID_MAINTENANCE_BODY)
+-            ->assertStatus(400)
+-        ;
+-
+-        Event::assertDispatchedTimes(MaintenanceStarted::class, 1);
+-        Event::assertNotDispatched(MaintenanceEnded::class);
+-    }
+-
+-    /**
+-     * M1 (folded into I1): a scalar-bodied signed request must be a 400, not
+-     * the 500 that fell out of MaintenancePayload::fromArray()'s array type
+-     * hint when handed an int or a string.
+-     */
+-    public function testSignedMaintenanceStartedWithScalarBodyReturns400(): void
+-    {
+-        Event::fake();
+-
+-        $body = '5';
+-
+-        $this->call('POST', self::PATH, [], [], [], $this->signedHeaders('maintenance.started', $body), $body)
+-            ->assertStatus(400)
+-        ;
+-
+-        $this->assertNoneOfOurEventsWereDispatched();
+-    }
+-
+-    public function testSignedPingWithScalarBodyReturns400(): void
+-    {
+-        Event::fake();
+-
+-        $body = '"hello"';
+-
+-        $this->call('POST', self::PATH, [], [], [], $this->signedHeaders('ping', $body), $body)
+-            ->assertStatus(400)
+-        ;
+-
+-        $this->assertNoneOfOurEventsWereDispatched();
+-    }
+-
+-    private function assertNoneOfOurEventsWereDispatched(): void
+-    {
+-        Event::assertNotDispatched(MaintenanceStarted::class);
+-        Event::assertNotDispatched(MaintenanceEnded::class);
+-        Event::assertNotDispatched(PingReceived::class);
+-    }
+-
+-    /** @return array<string, string> */
+-    private function signedHeaders(string $event, string $body): array
+-    {
+-        $timestamp = time();
+-        $v1 = hash_hmac('sha256', $timestamp . '.' . $body, self::SECRET);
+-
+-        return $this->transformHeadersToServerVars([
+-            VerifySignature::HEADER => "t={$timestamp},v1={$v1}",
+-            'X-AllSystems-Event' => $event,
+-        ]);
+-    }
+-}
+diff --git a/tests/WebhookTest.php b/tests/WebhookTest.php
+new file mode 100644
+index 0000000..2536682
+--- /dev/null
++++ b/tests/WebhookTest.php
+@@ -0,0 +1,269 @@
++<?php
++
++declare(strict_types=1);
++
++namespace AllSystems\Laravel\Tests;
++
++use AllSystems\Laravel\Http\Middleware\VerifySignature;
++use AllSystems\Laravel\PlatformMaintenance;
++use Illuminate\Contracts\Config\Repository as ConfigRepository;
++use Illuminate\Foundation\Application;
++use Illuminate\Testing\TestResponse;
++use PHPUnit\Framework\Attributes\DataProvider;
++use Psr\Log\LoggerInterface;
++
++final class WebhookTest extends TestCase
++{
++    private const URL = 'http://localhost/webhooks/allsystems';
++    private const GOLDEN_BODY = '{"id":"01920000-0000-7000-8000-00000000a001","event":"maintenance.started","title":"Database upgrade","message":"Upgrading PostgreSQL. Expect ~20 minutes of downtime.","starts_at":"2026-08-20T01:00:00Z","ends_at":"2026-08-20T01:30:00Z","components":[{"id":"01920000-0000-7000-8000-00000000c001","name":"Web app"},{"id":"01920000-0000-7000-8000-00000000c002","name":"Queue worker"}]}';
++    private const GOLDEN_V1 = 'c8b3afe8c09a8412359958dcc6c1c86d7bed4318abb431b733c210068c264613';
++
++    /** @var list<array{string, array<string, mixed>}> */
++    private array $warnings = [];
++
++    protected function defineEnvironment($app): void
++    {
++        parent::defineEnvironment($app);
++
++        assert($app instanceof Application);
++
++        $config = $app->make(ConfigRepository::class);
++
++        if ($this->name() === 'testAnUnsetOrEmptySecretRejectsAValidSignature') {
++            $config->set('allsystems.secret', $this->dataName() === 'empty' ? '' : null);
++        }
++
++        if ($this->name() === 'testTheRouteServesOnlyTheConfiguredDomain') {
++            $config->set('allsystems.domain', 'hooks.example.test');
++        }
++    }
++
++    protected function setUp(): void
++    {
++        parent::setUp();
++
++        $this->warnings = [];
++        $logger = $this->createStub(LoggerInterface::class);
++        $logger->method('warning')->willReturnCallback(function (string $message, array $context = []): void {
++            $this->warnings[] = [$message, $context];
++        });
++        $this->app?->instance(LoggerInterface::class, $logger);
++    }
++
++    public function testStartedOpensTheWindowAndARedeliveryIsANoop(): void
++    {
++        $body = $this->body('maintenance.started', 'window-1');
++
++        $this->deliver($body)->assertOk()->assertExactJson(['action' => 'activated']);
++        self::assertTrue($this->maintenance()->isActive());
++
++        $this->deliver($body)->assertOk()->assertExactJson(['action' => 'noop']);
++        self::assertTrue($this->maintenance()->isActive());
++    }
++
++    public function testEndedForTheOpenWindowDeactivatesIt(): void
++    {
++        $this->deliver($this->body('maintenance.started', 'window-1'))->assertOk();
++
++        $this->deliver($this->body('maintenance.ended', 'window-1'))->assertOk()->assertExactJson(['action' => 'deactivated']);
++        self::assertFalse($this->maintenance()->isActive());
++    }
++
++    public function testEndedForAnotherWindowIsANoopAndTheWindowStays(): void
++    {
++        $this->deliver($this->body('maintenance.started', 'window-1'))->assertOk();
++
++        $this->deliver($this->body('maintenance.ended', 'window-2'))->assertOk()->assertExactJson(['action' => 'noop']);
++        self::assertTrue($this->maintenance()->isActive());
++    }
++
++    public function testTheEventComesFromTheBodyNotTheHeader(): void
++    {
++        $this->deliver($this->body('maintenance.started', 'window-1'), event: 'maintenance.ended')
++            ->assertOk()
++            ->assertExactJson(['action' => 'activated'])
++        ;
++    }
++
++    /** @return array<string, array{string}> */
++    public static function rejectedSignatures(): array
++    {
++        return [
++            'missing header' => ['missing'],
++            'malformed header' => ['malformed'],
++            'wrong secret' => ['wrong_secret'],
++            'tampered body' => ['tampered'],
++            'stale timestamp' => ['stale'],
++            'future timestamp' => ['future'],
++        ];
++    }
++
++    #[DataProvider('rejectedSignatures')]
++    public function testRejectedSignaturesAnswer401AndLeaveTheWindowUntouched(string $case): void
++    {
++        $body = $this->body('maintenance.started', 'window-1');
++        $now = $this->clock->now()->getTimestamp();
++        $signed = fn (int $t, string $secret, string $over): string => "t={$t},v1=" . hash_hmac('sha256', $t . '.' . $over, $secret);
++
++        $header = match ($case) {
++            'missing' => null,
++            'malformed' => 'nonsense',
++            'wrong_secret' => $signed($now, 'other-secret', $body),
++            'tampered' => $signed($now, self::SECRET, $body . ' '),
++            'stale' => $signed($now - 301, self::SECRET, $body),
++            default => $signed($now + 301, self::SECRET, $body),
++        };
++
++        $this->send($body, $header)->assertUnauthorized()->assertExactJson(['error' => 'Invalid signature']);
++        self::assertFalse($this->maintenance()->isActive());
++    }
++
++    /** @return array<string, array{string}> */
++    public static function unconfiguredSecrets(): array
++    {
++        return ['null' => ['null'], 'empty' => ['empty']];
++    }
++
++    #[DataProvider('unconfiguredSecrets')]
++    public function testAnUnsetOrEmptySecretRejectsAValidSignature(string $case): void
++    {
++        $this->deliver($this->body('maintenance.started', 'window-1'))
++            ->assertUnauthorized()
++            ->assertExactJson(['error' => 'Invalid signature'])
++        ;
++        self::assertFalse($this->maintenance()->isActive());
++    }
++
++    public function testTheToleranceEdge(): void
++    {
++        $body = $this->body('maintenance.started', 'window-1');
++        $now = $this->clock->now()->getTimestamp();
++
++        $this->deliver($body, timestamp: $now - 300)->assertOk();
++        $this->deliver($body, timestamp: $now - 301)->assertUnauthorized();
++    }
++
++    public function testAPingAnswersNoop(): void
++    {
++        $this->deliver('{"event":"ping"}')->assertOk()->assertExactJson(['action' => 'noop']);
++    }
++
++    public function testAnUnknownEventIsIgnored(): void
++    {
++        $this->deliver('{"event":"maintenance.rescheduled","id":"window-1"}')->assertOk()->assertExactJson(['action' => 'ignored']);
++        self::assertFalse($this->maintenance()->isActive());
++    }
++
++    /** @return array<string, array{string}> */
++    public static function invalidBodies(): array
++    {
++        return [
++            'not json' => ['not json'],
++            'scalar' => ['"maintenance.started"'],
++            'list' => ['[]'],
++            'no event' => ['{"id":"window-1"}'],
++            'non-string event' => ['{"event":5,"id":"window-1"}'],
++            'started without id' => ['{"event":"maintenance.started"}'],
++            'ended with empty id' => ['{"event":"maintenance.ended","id":""}'],
++        ];
++    }
++
++    #[DataProvider('invalidBodies')]
++    public function testInvalidBodiesAnswer400(string $body): void
++    {
++        $this->deliver($body)->assertStatus(400)->assertExactJson(['error' => 'Invalid payload']);
++        self::assertFalse($this->maintenance()->isActive());
++    }
++
++    public function testTheGoldenDeliveryOpensTheWindow(): void
++    {
++        $this->send(self::GOLDEN_BODY, 't=1787000000,v1=' . self::GOLDEN_V1)
++            ->assertOk()
++            ->assertExactJson(['action' => 'activated'])
++        ;
++    }
++
++    /** @return array<string, array{string, string}> */
++    public static function rejectionReasons(): array
++    {
++        return [
++            'secret_unset' => ['secret_unset', 'unset'],
++            'malformed_header' => ['malformed_header', 'malformed'],
++            'timestamp_out_of_tolerance' => ['timestamp_out_of_tolerance', 'stale'],
++            'signature_mismatch' => ['signature_mismatch', 'mismatch'],
++        ];
++    }
++
++    #[DataProvider('rejectionReasons')]
++    public function testARejectionLogsExactlyOneWarningWithOnlyTheReason(string $reason, string $case): void
++    {
++        $body = '{"event":"ping"}';
++        $now = $this->clock->now()->getTimestamp();
++
++        if ($case === 'unset') {
++            $this->app?->make(ConfigRepository::class)->set('allsystems.secret', '');
++        }
++
++        $header = match ($case) {
++            'malformed' => 'nonsense',
++            'stale' => $this->header($now - 301, $body),
++            'mismatch' => $this->header($now, $body . ' '),
++            default => $this->header($now, $body),
++        };
++
++        $this->send($body, $header)->assertUnauthorized();
++
++        self::assertSame([['allsystems.webhook_rejected', ['reason' => $reason]]], $this->warnings);
++    }
++
++    public function testTheRouteServesOnlyTheConfiguredDomain(): void
++    {
++        $body = '{"event":"ping"}';
++        $headers = $this->transformHeadersToServerVars([VerifySignature::HEADER => $this->header($this->clock->now()->getTimestamp(), $body)]);
++
++        $this->call('POST', 'http://hooks.example.test/webhooks/allsystems', [], [], [], $headers, $body)->assertOk();
++        $this->call('POST', 'http://other.example.test/webhooks/allsystems', [], [], [], $headers, $body)->assertNotFound();
++    }
++
++    private function maintenance(): PlatformMaintenance
++    {
++        $maintenance = $this->app?->make(PlatformMaintenance::class);
++        assert($maintenance instanceof PlatformMaintenance);
++
++        return $maintenance;
++    }
++
++    private function body(string $event, string $id): string
++    {
++        return json_encode(['id' => $id, 'event' => $event], JSON_THROW_ON_ERROR);
++    }
++
++    private function header(int $timestamp, string $signedBody): string
++    {
++        return "t={$timestamp},v1=" . hash_hmac('sha256', $timestamp . '.' . $signedBody, self::SECRET);
++    }
++
++    /** @return TestResponse<\Symfony\Component\HttpFoundation\Response> */
++    private function deliver(string $body, ?int $timestamp = null, ?string $event = null): TestResponse
++    {
++        $timestamp ??= $this->clock->now()->getTimestamp();
++
++        return $this->send($body, $this->header($timestamp, $body), $event);
++    }
++
++    /** @return TestResponse<\Symfony\Component\HttpFoundation\Response> */
++    private function send(string $body, ?string $signature, ?string $event = null): TestResponse
++    {
++        $headers = [];
++
++        if ($signature !== null) {
++            $headers[VerifySignature::HEADER] = $signature;
++        }
++
++        if ($event !== null) {
++            $headers['X-AllSystems-Event'] = $event;
++        }
++
++        return $this->call('POST', self::URL, [], [], [], $this->transformHeadersToServerVars($headers), $body);
++    }
++}
+diff --git a/tests/views/custom-outage.blade.php b/tests/views/custom-outage.blade.php
+new file mode 100644
+index 0000000..e8744fa
+--- /dev/null
++++ b/tests/views/custom-outage.blade.php
+@@ -0,0 +1 @@
++custom outage page
+diff --git a/tests/views/maintenance-window.blade.php b/tests/views/maintenance-window.blade.php
+deleted file mode 100644
+index d31b824..0000000
+--- a/tests/views/maintenance-window.blade.php
++++ /dev/null
+@@ -1,2 +0,0 @@
+-<h1>Down for maintenance</h1>
+-<p>Retry after {{ $retryAfter }} seconds.</p>
