@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace AllSystems\Laravel\Tests;
 
 use AllSystems\Laravel\Http\Middleware\VerifySignature;
+use AllSystems\Laravel\SystemClock;
 use Illuminate\Contracts\Config\Repository as ConfigRepository;
 use Illuminate\Contracts\Foundation\MaintenanceMode;
 use Illuminate\Contracts\Http\Kernel as HttpKernelContract;
@@ -13,6 +14,8 @@ use Illuminate\Foundation\Http\Kernel as FoundationHttpKernel;
 use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance;
 use Illuminate\Routing\Route as RoutingRoute;
 use Illuminate\Support\Facades\Route;
+use Psr\Clock\ClockInterface;
+use Symfony\Component\Clock\MockClock;
 
 use function config;
 
@@ -35,6 +38,15 @@ final class ServiceProviderTest extends TestCase
         parent::tearDown();
     }
 
+    /** @return list<class-string> */
+    protected function getPackageProviders($app): array
+    {
+        // Registers first, as an app's own provider would, so its binding is already in place.
+        return $this->name() === 'testAnAppBindingOfTheClockWins'
+            ? [Doubles\MockClockProvider::class, ...parent::getPackageProviders($app)]
+            : parent::getPackageProviders($app);
+    }
+
     protected function defineEnvironment($app): void
     {
         parent::defineEnvironment($app);
@@ -54,6 +66,16 @@ final class ServiceProviderTest extends TestCase
         if ($this->name() === 'testWildcardConfiguredPathFallsBackToTheDefaultAndDoesNotExemptTheHomePage') {
             $app->make(ConfigRepository::class)->set('allsystems.path', '*');
         }
+    }
+
+    public function testTheClockDefaultsToTheSystemClock(): void
+    {
+        self::assertInstanceOf(SystemClock::class, $this->app?->make(ClockInterface::class));
+    }
+
+    public function testAnAppBindingOfTheClockWins(): void
+    {
+        self::assertInstanceOf(MockClock::class, $this->app?->make(ClockInterface::class));
     }
 
     public function testConfigMergesWithTheDocumentedDefaults(): void

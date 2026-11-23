@@ -11,6 +11,7 @@ use Illuminate\Contracts\Config\Repository as ConfigRepository;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance;
 use Illuminate\Support\ServiceProvider;
+use Psr\Clock\ClockInterface;
 
 final class AllSystemsServiceProvider extends ServiceProvider
 {
@@ -19,6 +20,7 @@ final class AllSystemsServiceProvider extends ServiceProvider
         $this->mergeConfigFrom(__DIR__ . '/../config/allsystems.php', 'allsystems');
 
         $this->app->scoped(SyncResult::class);
+        $this->app->bindIf(ClockInterface::class, SystemClock::class);
     }
 
     public function boot(ConfigRepository $config, Dispatcher $events): void

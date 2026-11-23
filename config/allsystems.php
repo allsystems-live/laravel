@@ -25,6 +25,12 @@ return [
      */
     'tolerance' => (int) env('ALLSYSTEMS_WEBHOOK_TOLERANCE', 300),
 
+    // Where the maintenance window is kept, in the default cache store.
+    'cache_key' => 'allsystems:platform-maintenance',
+
+    // Safety expiry in minutes, so a lost `ended` webhook cannot keep the app down.
+    'max_minutes' => (int) env('ALLSYSTEMS_MAINTENANCE_MAX_MINUTES', 30),
+
     'maintenance' => [
         /*
          * Whether the bundled SyncMaintenanceMode listener is registered. Set
