@@ -1,0 +1,11 @@
+# Default rules, plus one allowlist for the public golden test vector: the webhook signing
+# secret in tests/TestCase.php and docs/webhook-contract.md is a published fixture, not a
+# credential, and pipeline review packages (.superpowers/sdd/*/review-branch.diff) copy it.
+# Only that exact value is allowed, so any other secret on the same line still fires.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public webhook contract test vector (not a real secret)"
+regexTarget = "match"
+regexes = ['''whsec_test_31d4a1f7c0b84e6fa9d2c5e8b7043f16''']
