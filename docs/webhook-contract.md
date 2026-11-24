@@ -81,6 +81,8 @@ Headers:
 
 **Responses.** Every answer is JSON. `200 {"action":"activated"}` and `{"action":"deactivated"}` when the window changed; `{"action":"noop"}` for a redelivered `started`, an `ended` for a window that is not the open one (including "nothing is open") and a `ping`; `{"action":"ignored"}` for an event type this package does not know. `401 {"error":"Invalid signature"}` and `400 {"error":"Invalid payload"}` otherwise.
 
+**Processing order.** The signature is checked first (`401`), then the body (`400`; a ping answers `noop` and an unknown event is ignored). For `maintenance.started` and `maintenance.ended`, the app's `MaintenanceInterceptor` runs next if one is bound, then the platform window. A window the interceptor claims does not touch the platform window. This step is specific to the Laravel package; receivers in other languages can ignore it.
+
 **Idempotency.** The key is `(id, event)`; see The window for the two noop cases.
 
 **Delivery semantics.** Any `2xx` response is success. Anything else — a non-2xx status, a timeout, or a transport error — is retried, six times over roughly nineteen minutes, and then given up on.
