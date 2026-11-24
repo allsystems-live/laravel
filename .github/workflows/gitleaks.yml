@@ -1,0 +1,70 @@
+# allsystems/laravel's own copy of JMWD-Platform/ci-workflows main's .github/workflows/gitleaks.yml (823f402).
+# This repo is public and ci-workflows is internal, so GitHub cannot run the shared required workflow here:
+# enterprise ruleset 27946839 "Required gitleaks" excludes laravel, and this file keeps its secret scan.
+# Keep it in step with the shared file; only this header differs.
+#
+# Scans only the commits the PR (or merge queue entry) adds (base..head), including what a merge commit adds
+# beyond an automatic merge (--diff-merges=remerge), so history that predates this check
+# never blocks a PR. Uses the gitleaks CLI directly, pinned by version AND checksum:
+# the gitleaks GitHub Action needs a paid-for licence key on organisation accounts, and
+# this estate buys no paid security SKUs. A repo can tune findings with `.gitleaks.toml`
+# and `.gitleaksignore` at its root, both read from the PR's base branch so a PR cannot
+# silence its own scan: a tuning change lands in its own PR first. A `.gitleaksignore`
+# fingerprint names a commit, so it cannot cover a PR's own new commits; use a rule-scoped
+# allowlist (regex or path) in `.gitleaks.toml`, or an inline `gitleaks:allow` on the line,
+# which is honoured because it is visible in the PR diff.
+# A PR's merge box lists a ruleset-required workflow by its WORKFLOW name alone ("JMWD -
+# Required workflow passed"), never the job, so the workflow name itself must say both
+# where it comes from and what it checks: "JMWD / gitleaks". The job keeps an explicit
+# name for the per-job Checks tab. The ruleset references this file by path, never by
+# name, so renaming is safe.
+name: JMWD / gitleaks
+
+on:
+  pull_request:
+  merge_group:
+
+# One run per PR: a new push cancels the older run still queued or running for the same PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    # Pipeline drafts start no runner; the ruleset ignores `types:`, so ready_for_review never starts this workflow.
+    # The push or close/reopen after `gh pr ready` runs the scan. A skipped job reports success, so skip build/* only.
+    if: github.event.pull_request.draft != true || !startsWith(github.head_ref, 'build/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks (pinned version + checksum)
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+
+      - name: Scan the commits this PR adds
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          for f in .gitleaks.toml .gitleaksignore; do rm -f "$f"; git show "${BASE_SHA}:$f" > "$f" 2>/dev/null || rm -f "$f"; done
+          "$RUNNER_TEMP/gitleaks" git --no-banner --redact --verbose \
+            --log-opts="--diff-merges=remerge ${BASE_SHA}..${HEAD_SHA}" .

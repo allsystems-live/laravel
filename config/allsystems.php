@@ -15,7 +15,12 @@ return [
      * leading slash. Change it if it collides with something; AllSystems only
      * needs the full URL you register there.
      */
-    'path' => env('ALLSYSTEMS_WEBHOOK_PATH', 'allsystems/webhook'),
+    'path' => env('ALLSYSTEMS_WEBHOOK_PATH', 'webhooks/allsystems'),
+
+    /*
+     * Restricts the webhook route to this host. Null serves it on every host.
+     */
+    'domain' => env('ALLSYSTEMS_WEBHOOK_DOMAIN'),
 
     /*
      * How far the signature timestamp may be from now, in seconds, before the
@@ -25,33 +30,21 @@ return [
      */
     'tolerance' => (int) env('ALLSYSTEMS_WEBHOOK_TOLERANCE', 300),
 
-    'maintenance' => [
-        /*
-         * Whether the bundled SyncMaintenanceMode listener is registered. Set
-         * false to receive the events and do your own thing with them; the
-         * webhook still verifies and still dispatches.
-         */
-        'enabled' => (bool) env('ALLSYSTEMS_MAINTENANCE_ENABLED', true),
+    // Where the maintenance window is kept, in the default cache store.
+    'cache_key' => 'allsystems:platform-maintenance',
 
-        /*
-         * Everything below is your app's own maintenance-mode configuration,
-         * passed straight through to Laravel. AllSystems never sends any of it
-         * and never sees it.
-         */
+    // Safety expiry in minutes, so a lost `ended` webhook cannot keep the app down.
+    'max_minutes' => (int) env('ALLSYSTEMS_MAINTENANCE_MAX_MINUTES', 30),
 
-        // Bypass phrase: visiting /{secret} sets a cookie that lets you through.
-        'secret' => env('ALLSYSTEMS_MAINTENANCE_BYPASS_SECRET'),
+    // Seconds sent in the Retry-After header of the 503.
+    'retry_after' => 60,
 
-        // A view name, rendered when the window opens and served as the
-        // maintenance page. Equivalent to `artisan down --render=`.
-        'template' => env('ALLSYSTEMS_MAINTENANCE_TEMPLATE'),
+    // Paths the gate lets through during a window, besides the webhook; `up` keeps deploy smoke checks green.
+    'except' => ['up'],
 
-        // A path to redirect all traffic to. Equivalent to `--redirect=`.
-        'redirect' => env('ALLSYSTEMS_MAINTENANCE_REDIRECT'),
+    // The view served as the 503 page for HTML requests.
+    'view' => 'allsystems::maintenance',
 
-        // Seconds for the Refresh header. Equivalent to `--refresh=`.
-        'refresh' => env('ALLSYSTEMS_MAINTENANCE_REFRESH') === null
-            ? null
-            : (int) env('ALLSYSTEMS_MAINTENANCE_REFRESH'),
-    ],
+    // The `detail` of the JSON:API 503 body.
+    'json_detail' => "We're doing some scheduled maintenance. Please try again in a minute or two.",
 ];

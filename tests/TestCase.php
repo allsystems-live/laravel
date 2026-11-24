@@ -9,10 +9,16 @@ use Illuminate\Contracts\Config\Repository as ConfigRepository;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance;
 use Orchestra\Testbench\TestCase as OrchestraTestCase;
+use Psr\Clock\ClockInterface;
+use Symfony\Component\Clock\MockClock;
 
 abstract class TestCase extends OrchestraTestCase
 {
     protected const SECRET = 'whsec_test_31d4a1f7c0b84e6fa9d2c5e8b7043f16';
+
+    protected const NOW = 1787000000;
+
+    protected MockClock $clock;
 
     protected function setUp(): void
     {
@@ -37,5 +43,17 @@ abstract class TestCase extends OrchestraTestCase
         assert($app instanceof Application);
 
         $app->make(ConfigRepository::class)->set('allsystems.secret', self::SECRET);
+
+        $this->clock = new MockClock('@' . self::NOW);
+
+        if ($this->mocksTheClock()) {
+            $app->instance(ClockInterface::class, $this->clock);
+        }
+    }
+
+    /** A test of the production clock default opts out. */
+    protected function mocksTheClock(): bool
+    {
+        return true;
     }
 }

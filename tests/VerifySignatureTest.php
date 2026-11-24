@@ -10,12 +10,12 @@ use Illuminate\Foundation\Application;
 
 /**
  * Drives real HTTP through the registered route, exercising VerifySignature
- * as the only thing between an anonymous request and the (stub)
+ * as the only thing between an anonymous request and the
  * WebhookController — which is exactly the boundary it exists to guard.
  */
 final class VerifySignatureTest extends TestCase
 {
-    private const PATH = '/allsystems/webhook';
+    private const PATH = '/webhooks/allsystems';
 
     protected function defineEnvironment($app): void
     {
@@ -33,7 +33,7 @@ final class VerifySignatureTest extends TestCase
     public function testACorrectlySignedRequestReachesTheController(): void
     {
         $body = '{"event":"ping"}';
-        $timestamp = time();
+        $timestamp = $this->clock->now()->getTimestamp();
 
         $this->call('POST', self::PATH, [], [], [], $this->signedHeaders($timestamp, $body), $body)
             ->assertOk()
@@ -44,17 +44,19 @@ final class VerifySignatureTest extends TestCase
     {
         $this->call('POST', self::PATH, [], [], [], $this->transformHeadersToServerVars([]), '{}')
             ->assertUnauthorized()
+            ->assertExactJson(['error' => 'Invalid signature'])
         ;
     }
 
     public function testHeaderWithOnlyTimestampIsRejected(): void
     {
         $headers = $this->transformHeadersToServerVars([
-            'X-AllSystems-Signature' => 't=' . time(),
+            'X-AllSystems-Signature' => 't=' . $this->clock->now()->getTimestamp(),
         ]);
 
         $this->call('POST', self::PATH, [], [], [], $headers, '{}')
             ->assertUnauthorized()
+            ->assertExactJson(['error' => 'Invalid signature'])
         ;
     }
 
@@ -66,17 +68,19 @@ final class VerifySignatureTest extends TestCase
 
         $this->call('POST', self::PATH, [], [], [], $headers, '{}')
             ->assertUnauthorized()
+            ->assertExactJson(['error' => 'Invalid signature'])
         ;
     }
 
     public function testV1ThatIsNotSixtyFourHexCharsIsRejected(): void
     {
         $headers = $this->transformHeadersToServerVars([
-            'X-AllSystems-Signature' => 't=' . time() . ',v1=deadbeef',
+            'X-AllSystems-Signature' => 't=' . $this->clock->now()->getTimestamp() . ',v1=deadbeef',
         ]);
 
         $this->call('POST', self::PATH, [], [], [], $headers, '{}')
             ->assertUnauthorized()
+            ->assertExactJson(['error' => 'Invalid signature'])
         ;
     }
 
@@ -86,10 +90,11 @@ final class VerifySignatureTest extends TestCase
     public function testAStaleTimestampIsRejected(): void
     {
         $body = '{"event":"ping"}';
-        $timestamp = time() - 301;
+        $timestamp = $this->clock->now()->getTimestamp() - 301;
 
         $this->call('POST', self::PATH, [], [], [], $this->signedHeaders($timestamp, $body), $body)
             ->assertUnauthorized()
+            ->assertExactJson(['error' => 'Invalid signature'])
         ;
     }
 
@@ -100,10 +105,11 @@ final class VerifySignatureTest extends TestCase
     public function testAFutureTimestampIsRejected(): void
     {
         $body = '{"event":"ping"}';
-        $timestamp = time() + 301;
+        $timestamp = $this->clock->now()->getTimestamp() + 301;
 
         $this->call('POST', self::PATH, [], [], [], $this->signedHeaders($timestamp, $body), $body)
             ->assertUnauthorized()
+            ->assertExactJson(['error' => 'Invalid signature'])
         ;
     }
 
@@ -115,7 +121,7 @@ final class VerifySignatureTest extends TestCase
     public function testNowMinus299PassesTheToleranceBoundary(): void
     {
         $body = '{"event":"ping"}';
-        $timestamp = time() - 299;
+        $timestamp = $this->clock->now()->getTimestamp() - 299;
 
         $this->call('POST', self::PATH, [], [], [], $this->signedHeaders($timestamp, $body), $body)
             ->assertOk()
@@ -124,11 +130,12 @@ final class VerifySignatureTest extends TestCase
 
     public function testASignatureOverADifferentBodyIsRejected(): void
     {
-        $timestamp = time();
+        $timestamp = $this->clock->now()->getTimestamp();
         $headers = $this->signedHeaders($timestamp, '{"event":"ping"}');
 
         $this->call('POST', self::PATH, [], [], [], $headers, '{"event":"totally-different"}')
             ->assertUnauthorized()
+            ->assertExactJson(['error' => 'Invalid signature'])
         ;
     }
 
@@ -139,10 +146,11 @@ final class VerifySignatureTest extends TestCase
         // header — to prove the rejection is the missing config, not a
         // malformed request.
         $body = '{"event":"ping"}';
-        $timestamp = time();
+        $timestamp = $this->clock->now()->getTimestamp();
 
         $this->call('POST', self::PATH, [], [], [], $this->signedHeaders($timestamp, $body), $body)
             ->assertUnauthorized()
+            ->assertExactJson(['error' => 'Invalid signature'])
         ;
     }
 
@@ -156,7 +164,7 @@ final class VerifySignatureTest extends TestCase
     public function testNonCanonicalJsonSpacingStillVerifiesBecauseTheRawBodyIsSigned(): void
     {
         $body = '{"event": "ping", "application": {"id": "01920000-0000-7000-8000-00000000b001"}}';
-        $timestamp = time();
+        $timestamp = $this->clock->now()->getTimestamp();
         $headers = $this->signedHeaders($timestamp, $body);
 
         $this->call('POST', self::PATH, [], [], [], $headers, $body)
@@ -171,10 +179,6 @@ final class VerifySignatureTest extends TestCase
 
         return $this->transformHeadersToServerVars([
             VerifySignature::HEADER => "t={$timestamp},v1={$v1}",
-            // Every body signed in this file declares "event":"ping" (or no
-            // event at all, for the requests VerifySignature itself rejects
-            // before the controller's event/header cross-check ever runs).
-            'X-AllSystems-Event' => 'ping',
         ]);
     }
 }

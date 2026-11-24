@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace AllSystems\Laravel\Tests;
 
 use AllSystems\Laravel\Http\Middleware\VerifySignature;
+use AllSystems\Laravel\SystemClock;
 use Illuminate\Contracts\Config\Repository as ConfigRepository;
 use Illuminate\Contracts\Foundation\MaintenanceMode;
 use Illuminate\Contracts\Http\Kernel as HttpKernelContract;
@@ -13,6 +14,8 @@ use Illuminate\Foundation\Http\Kernel as FoundationHttpKernel;
 use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance;
 use Illuminate\Routing\Route as RoutingRoute;
 use Illuminate\Support\Facades\Route;
+use Psr\Clock\ClockInterface;
+use Symfony\Component\Clock\MockClock;
 
 use function config;
 
@@ -33,6 +36,21 @@ final class ServiceProviderTest extends TestCase
         }
 
         parent::tearDown();
+    }
+
+    /** @return list<class-string> */
+    protected function getPackageProviders($app): array
+    {
+        // Registers first, as an app's own provider would, so its binding is already in place.
+        return $this->name() === 'testAnAppBindingOfTheClockWins'
+            ? [Doubles\MockClockProvider::class, ...parent::getPackageProviders($app)]
+            : parent::getPackageProviders($app);
+    }
+
+    protected function mocksTheClock(): bool
+    {
+        // These two assert which binding the provider leaves in place, so the harness must not bind one.
+        return !in_array($this->name(), ['testTheClockDefaultsToTheSystemClock', 'testAnAppBindingOfTheClockWins'], true);
     }
 
     protected function defineEnvironment($app): void
@@ -56,19 +74,22 @@ final class ServiceProviderTest extends TestCase
         }
     }
 
-    public function testConfigMergesWithTheDocumentedDefaults(): void
+    public function testTheClockDefaultsToTheSystemClock(): void
     {
-        self::assertSame('allsystems/webhook', config('allsystems.path'));
-        self::assertSame(300, config('allsystems.tolerance'));
-        self::assertTrue(config('allsystems.maintenance.enabled'));
+        self::assertInstanceOf(SystemClock::class, $this->app?->make(ClockInterface::class));
+    }
+
+    public function testAnAppBindingOfTheClockWins(): void
+    {
+        self::assertInstanceOf(MockClock::class, $this->app?->make(ClockInterface::class));
     }
 
     public function testConsumerPathOverrideMovesTheRoute(): void
     {
-        $this->call('POST', '/custom/hook', [], [], [], $this->signedHeaders('[]'), '[]')
+        $this->call('POST', '/custom/hook', [], [], [], $this->signedHeaders('{"event":"ping"}'), '{"event":"ping"}')
             ->assertOk()
         ;
-        $this->postJson('/allsystems/webhook')->assertNotFound();
+        $this->postJson('/webhooks/allsystems')->assertNotFound();
     }
 
     public function testTheRouteIsNamedAndCarriesOnlyVerifySignature(): void
@@ -99,7 +120,7 @@ final class ServiceProviderTest extends TestCase
             'status' => 503,
         ]);
 
-        $this->call('POST', '/allsystems/webhook', [], [], [], $this->signedHeaders('[]'), '[]')
+        $this->call('POST', '/webhooks/allsystems', [], [], [], $this->signedHeaders('{"event":"ping"}'), '{"event":"ping"}')
             ->assertOk()
         ;
         $this->get('/')->assertServiceUnavailable();
@@ -113,7 +134,7 @@ final class ServiceProviderTest extends TestCase
      */
     public function testEmptyConfiguredPathFallsBackToTheDefaultAndDoesNotExemptTheHomePage(): void
     {
-        self::assertSame('allsystems/webhook', config('allsystems.path'));
+        self::assertSame('webhooks/allsystems', config('allsystems.path'));
 
         $app = $this->app;
         assert($app !== null);
@@ -124,7 +145,7 @@ final class ServiceProviderTest extends TestCase
 
         $app->make(MaintenanceMode::class)->activate(['except' => [], 'status' => 503]);
 
-        $this->call('POST', '/allsystems/webhook', [], [], [], $this->signedHeaders('[]'), '[]')
+        $this->call('POST', '/webhooks/allsystems', [], [], [], $this->signedHeaders('{"event":"ping"}'), '{"event":"ping"}')
             ->assertOk()
         ;
         $this->get('/')->assertServiceUnavailable();
@@ -136,7 +157,7 @@ final class ServiceProviderTest extends TestCase
      */
     public function testWildcardConfiguredPathFallsBackToTheDefaultAndDoesNotExemptTheHomePage(): void
     {
-        self::assertSame('allsystems/webhook', config('allsystems.path'));
+        self::assertSame('webhooks/allsystems', config('allsystems.path'));
 
         $app = $this->app;
         assert($app !== null);
@@ -147,7 +168,7 @@ final class ServiceProviderTest extends TestCase
 
         $app->make(MaintenanceMode::class)->activate(['except' => [], 'status' => 503]);
 
-        $this->call('POST', '/allsystems/webhook', [], [], [], $this->signedHeaders('[]'), '[]')
+        $this->call('POST', '/webhooks/allsystems', [], [], [], $this->signedHeaders('{"event":"ping"}'), '{"event":"ping"}')
             ->assertOk()
         ;
         $this->get('/')->assertServiceUnavailable();
@@ -166,13 +187,13 @@ final class ServiceProviderTest extends TestCase
 
         $exemptions = $app->make(PreventRequestsDuringMaintenance::class);
 
-        self::assertSame(['allsystems/webhook'], $exemptions->getExcludedPaths());
+        self::assertSame(['webhooks/allsystems'], $exemptions->getExcludedPaths());
     }
 
     /** @return array<string, string> */
     private function signedHeaders(string $body): array
     {
-        $timestamp = time();
+        $timestamp = $this->clock->now()->getTimestamp();
         $v1 = hash_hmac('sha256', $timestamp . '.' . $body, self::SECRET);
 
         return $this->transformHeadersToServerVars([

@@ -12,7 +12,15 @@ use Illuminate\Support\Facades\Route;
  * (the HMAC signature IS the authentication). VerifySignature is the only thing
  * standing in front of the controller, and it must stay that way.
  */
-Route::post(config('allsystems.path'), WebhookController::class)
+$webhook = static fn () => Route::post(config('allsystems.path'), WebhookController::class)
     ->middleware(VerifySignature::class)
     ->name('allsystems.webhook')
 ;
+
+$domain = config('allsystems.domain');
+
+if (is_string($domain) && $domain !== '') {
+    Route::domain($domain)->group($webhook);
+} else {
+    $webhook();
+}
