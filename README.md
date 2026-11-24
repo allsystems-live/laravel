@@ -60,7 +60,7 @@ use AllSystems\Laravel\Contracts\MaintenanceInterceptor;
 $this->app->bind(MaintenanceInterceptor::class, YourInterceptor::class);
 ```
 
-Put the binding in a service provider's `register()`. With nothing bound, the package behaves as before.
+Put the binding in a service provider's `register()`. With nothing bound, every maintenance delivery opens or closes the platform window.
 
 ## Run it
 

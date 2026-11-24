@@ -1,0 +1,652 @@
+Release note:
+Audience: internal
+Tooling: apps using the AllSystems Laravel package can now take over a maintenance window themselves before the package's own maintenance mode starts or ends, so each app no longer needs its own copy of the webhook receiver.
+
+## Commits
+926c6bd AS-403: ledger chunk 2
+e2e4b52 AS-403: Document MaintenanceInterceptor and add v0.2.0 changelog
+980b4e7 AS-403: ledger chunk 1
+dd28c77 AS-403: MaintenanceInterceptor hook in WebhookController
+f0558f4 plan: AS-403-allsystems-laravel-apps-can-intercept-a
+
+## Stat
+ .../chunk-1-brief.md                               |  40 ++++
+ .../chunk-1-report.md                              |  23 +++
+ .../chunk-2-brief.md                               |  29 +++
+ .../chunk-2-report.md                              |  10 +
+ .../progress.md                                    |   2 +
+ CHANGELOG.md                                       |   5 +
+ README.md                                          |  18 +-
+ ...-403-allsystems-laravel-apps-can-intercept-a.md |  67 +++++++
+ docs/webhook-contract.md                           |   2 +
+ src/Contracts/MaintenanceInterceptor.php           |  27 +++
+ src/Http/Controllers/WebhookController.php         |  19 +-
+ tests/MaintenanceInterceptorTest.php               | 202 +++++++++++++++++++++
+ 12 files changed, 440 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-1-brief.md b/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-1-brief.md
+new file mode 100644
+index 0000000..9c245a6
+--- /dev/null
++++ b/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-1-brief.md
+@@ -0,0 +1,40 @@
++# Chunk 1 brief: AS-403
++
++Project skills: none
++
++Touched-test command (from the worktree root): `vendor/bin/phpunit tests/MaintenanceInterceptorTest.php tests/WebhookTest.php`, plus `vendor/bin/pint --test` and `composer analyse` on what you touch.
++
++Report path: /Users/joshmurray/dev/agent-farm/laravel-AS-403-allsystems-laravel-apps-can-intercept-a/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-1-report.md (commit it with `git add -f` alongside the code).
++
++## Chunk 1: the interceptor contract and the controller hook
++
++**Files**
++- Create: src/Contracts/MaintenanceInterceptor.php
++- Modify: src/Http/Controllers/WebhookController.php
++- Test: tests/MaintenanceInterceptorTest.php
++
++**Interfaces**
++- Hands later chunks: `AllSystems\Laravel\Contracts\MaintenanceInterceptor` with `started(string $windowId, array $payload): ?string` (docblock `@param array<string, mixed> $payload`, `@return 'activated'|'noop'|null`; null lets the platform window open) and `ended(string $windowId, array $payload): ?string` (`@return 'deactivated'|null`; null lets `PlatformMaintenance::end()` run). Interface docblock: an app binds it in a service provider's `register()` to claim a window before the platform window opens or closes.
++- `WebhookController::__construct(private readonly PlatformMaintenance $maintenance, private readonly ?MaintenanceInterceptor $interceptor = null)`.
++
++**Behaviour**
++- Class docblock gains: "An app may bind MaintenanceInterceptor to claim a window before the platform window opens or closes."
++- Nothing before the `$id` check changes, so ping, unknown events, 400s and (in the middleware) 401s never reach the interceptor.
++- After the `$id` check, replace the single ternary with two branches: for `maintenance.ended`, `$action = $this->interceptor?->ended($id, $payload)`; answer `$action` when it is exactly `'deactivated'`, otherwise answer `$this->maintenance->end($id)`. For `maintenance.started`, `$action = $this->interceptor?->started($id, $payload)`; answer it when it is `'activated'` or `'noop'` (strict `in_array`), otherwise `$this->maintenance->start($id)`. Any other string is treated as null.
++- `$payload` passed is the already-decoded array (`array<mixed>` from `json_decode`); if phpstan objects to passing it as `array<string, mixed>`, narrow with a `/** @var array<string, mixed> $payload */` on the decoded value rather than loosening the interface docblock.
++- Nothing is bound by the provider. Laravel's container, on `BindingResolutionException` for an unbound interface parameter that has a default value, passes the default (`Container::resolveClass()`), so `null` arrives when no app binds the interface. A test in this chunk proves it.
++
++**Test scenarios** (new `tests/MaintenanceInterceptorTest.php`, extends `TestCase`)
++- A recording test double, an anonymous class built in `defineEnvironment()` and implementing the interface: per-test configurable returns for `started()`/`ended()`, records every call as `[method, windowId, payload]`. Bind it with `$app->instance(MaintenanceInterceptor::class, $double)` in `defineEnvironment()`.
++- Copy the four private helpers (`maintenance()`, `body()`, `header()`, `deliver()`/`send()`) from `tests/WebhookTest.php` into the new test; do not extract them from `WebhookTest.php` (its cases stay unchanged).
++- `testStartedClaimedAsActivatedLeavesThePlatformWindowShut`: answer `activated`, `isActive()` false, the double recorded `started` with the id and the decoded body (assert the full array, using a body that carries `components`).
++- `testStartedClaimedAsNoopLeavesThePlatformWindowShut`: answer `noop`, `isActive()` false.
++- `testStartedNotClaimedOpensThePlatformWindow`: double returns null; answer `activated`, `isActive()` true.
++- `testEndedClaimedLeavesTheOpenWindowOpen`: open window-1 with started (double returns null), then ended window-1 with double returning `deactivated`; answer `deactivated`, `isActive()` still true, double recorded `ended` with the id and body.
++- `testEndedNotClaimedClosesTheOpenWindow`: same setup, ended returns null; answer `deactivated`, `isActive()` false.
++- `testOutOfContractReturnsAreTreatedAsNull` (data provider): `started()` returning `'deactivated'` (and `'ignored'`) opens the window and answers `activated`; `ended()` returning `'noop'` closes the open window and answers `deactivated`.
++- `testTheInterceptorIsNotCalledFor` (data provider): ping, unknown event, bad signature (wrong v1), invalid body (non-JSON, and a started body with an empty id); the double records no call.
++- `testUnboundInterceptorResolvesToNull`: in a test that does not bind (gate the binding in `defineEnvironment()` on `$this->name()`, as `WebhookTest` does), `app(WebhookController::class)` resolves and a started delivery answers `activated` with the window open.
++
++**ACs met**: 1, 2 (with the unchanged `WebhookTest.php`), 3, 4, 5, 6, 8 (for the code).
++
+diff --git a/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-1-report.md b/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-1-report.md
+new file mode 100644
+index 0000000..785ee5f
+--- /dev/null
++++ b/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-1-report.md
+@@ -0,0 +1,23 @@
++Chunk: 1
++Status: complete
++Started: 
++
++Project skills: none
++
++## Built
++- src/Contracts/MaintenanceInterceptor.php: started()/ended() contract.
++- WebhookController: optional nullable interceptor; started answers it on 'activated'/'noop', ended on 'deactivated', else platform start()/end(). Added a @var array<string, mixed> on the decoded payload (phpstan clean).
++- tests/MaintenanceInterceptorTest.php: all brief scenarios (14 cases incl. providers, unbound-resolves-null).
++
++## Tests
++- vendor/bin/phpunit tests/MaintenanceInterceptorTest.php tests/WebhookTest.php -> OK (42 tests, 118 assertions)
++- vendor/bin/pint --test -> passed; composer analyse -> no errors
++
++## Prove-fail
++Reverted WebhookController: new test file -> 3 failures (claimed started/ended cases); reapplied -> 14 green.
++
++## Deviations
++- The recording double is a named final class RecordingInterceptor in the test file, not an anonymous class: phpstan rejects property access on an anonymous object-typed property. Its properties/returns carry a widened docblock so out-of-contract returns can be tested.
++
++## Files
++src/Contracts/MaintenanceInterceptor.php, src/Http/Controllers/WebhookController.php, tests/MaintenanceInterceptorTest.php, this report.
+diff --git a/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-2-brief.md b/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-2-brief.md
+new file mode 100644
+index 0000000..8152c4d
+--- /dev/null
++++ b/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-2-brief.md
+@@ -0,0 +1,29 @@
++# Chunk 2 brief: AS-403
++
++Project skills: none
++
++Touched-test command (from the worktree root): `vendor/bin/pint --test && composer analyse && vendor/bin/phpunit` (docs only, so confirm nothing else moved).
++
++Report path: /Users/joshmurray/dev/agent-farm/laravel-AS-403-allsystems-laravel-apps-can-intercept-a/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-2-report.md (commit it with `git add -f` alongside the docs).
++
++## Chunk 2: docs and changelog for v0.2.0
++
++**Files**
++- Modify: README.md (new "Intercepting a window" section after Install; require line in Install bumped to `^0.2.0` so the documented feature is installable)
++- Modify: docs/webhook-contract.md (processing order under "The webhook contract")
++- Modify: CHANGELOG.md (a `## v0.2.0` section above v0.1.0)
++
++**Interfaces**
++- Consumes the interface and controller behaviour from chunk 1; hands nothing on.
++
++**Behaviour**
++- README "Intercepting a window" (between `## Install` and `## Run it`): what the interface is for (an app claims a window before the platform window changes), when each method runs (`started()` on a signed, valid `maintenance.started`; `ended()` on a signed, valid `maintenance.ended`; never for ping, unknown events, 401 or 400), what each return means (`activated`/`noop` from `started()` and `deactivated` from `ended()` become the webhook answer and the platform window is left alone; null, or any other value, falls through to the v0.1.0 behaviour), and the binding: `$this->app->bind(MaintenanceInterceptor::class, YourInterceptor::class);` in a service provider's `register()`, with the `use AllSystems\Laravel\Contracts\MaintenanceInterceptor;` line.
++- docs/webhook-contract.md, inside "The webhook contract" (after the Responses paragraph, before Idempotency): a short "Processing order" paragraph or list: signature (401), body (400; ping answers noop, unknown events ignored), the app's `MaintenanceInterceptor` if one is bound, then the platform window. State that a claimed window does not touch the platform window, and that receivers in other languages can ignore the step.
++- CHANGELOG: `## v0.2.0` with "Optional `MaintenanceInterceptor`: an app can claim a `maintenance.started` or `maintenance.ended` before the platform window changes." plus one line that nothing changes when it is not bound.
++- Markdown: one line per paragraph, no hard wrapping.
++
++**Test scenarios**
++- None beyond the full gate run (`bash scripts/run-gates.sh --repo laravel AS-403-allsystems-laravel-apps-can-intercept-a`), which must be green after this chunk.
++
++**ACs met**: 7, 8.
++
+diff --git a/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-2-report.md b/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-2-report.md
+new file mode 100644
+index 0000000..2d28f8b
+--- /dev/null
++++ b/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/chunk-2-report.md
+@@ -0,0 +1,10 @@
++Chunk: 2
++Status: complete
++Started: 2026-11-24T11:08:11Z
++Project skills: none
++
++Built: README "Intercepting a window" section and `^0.2.0` require line, docs/webhook-contract.md "Processing order" paragraph, CHANGELOG v0.2.0. Docs match src/Contracts/MaintenanceInterceptor.php and WebhookController.
++Tests: `vendor/bin/pint --test && composer analyse && vendor/bin/phpunit` -> OK (87 tests); `bash scripts/run-gates.sh --repo laravel AS-403-allsystems-laravel-apps-can-intercept-a` -> GREEN.
++Prove-fail: n/a (docs only).
++Files: README.md, docs/webhook-contract.md, CHANGELOG.md.
++Unrequested changes: none. Plan discrepancies: none.
+diff --git a/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/progress.md b/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/progress.md
+new file mode 100644
+index 0000000..c209d56
+--- /dev/null
++++ b/.superpowers/sdd/AS-403-allsystems-laravel-apps-can-intercept-a/progress.md
+@@ -0,0 +1,2 @@
++Chunk 1: complete dd28c77
++Chunk 2: complete e2e4b52
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 267cabe..fd2a3c4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,14 +1,19 @@
+ # Changelog
+ 
+ All notable changes to `allsystems/laravel` are documented here.
+ 
++## v0.2.0
++
++- Optional `MaintenanceInterceptor`: an app can claim a `maintenance.started` or `maintenance.ended` before the platform window changes.
++- Nothing changes when no interceptor is bound.
++
+ ## v0.1.0
+ 
+ - Signed webhook at `POST {allsystems.path}` (default `webhooks/allsystems`, optionally restricted to `allsystems.domain`) with no CSRF, session or auth middleware: the HMAC signature is the authentication.
+ - `VerifySignature` middleware: parses `t=<unix>,v1=<hex>`, enforces a 300-second replay tolerance and compares digests with `hash_equals()`; failures answer `401 {"error":"Invalid signature"}`.
+ - `PlatformMaintenance`: the maintenance window is a flag in the default cache store keyed by window id, expiring after `allsystems.max_minutes`, so no database is touched. Webhook answers are `{"action":"activated|deactivated|noop|ignored"}`.
+ - `PlatformMaintenanceMiddleware` for the global stack: 503 with `Retry-After` and `Cache-Control: no-store` while a window is open, a JSON:API body for JSON requests, and a bundled self-contained page (`allsystems::maintenance`) for HTML. Exempts `up`, the webhook path and `allsystems.except`.
+ - The webhook path is exempted from Laravel's `PreventRequestsDuringMaintenance`, so `ended` still lands after a hand-run `artisan down`.
+ - `config/allsystems.php`: `secret`, `path`, `domain`, `tolerance`, `cache_key`, `max_minutes`, `retry_after`, `except`, `view`, `json_detail`.
+ - CI matrix across PHP 8.2-8.4 and Laravel 12-13 (5 cells; PHP 8.2 x Laravel 13 excluded because `orchestra/testbench` ^11 requires PHP 8.3 or later). Laravel 11 is unsupported: every `laravel/framework` 11.x release is blocked by Composer's default security-advisory check.
+ - README and `docs/webhook-contract.md` document the contract, including a golden HMAC test vector for non-Laravel receivers.
+diff --git a/README.md b/README.md
+index 26a07d9..41e8ff1 100644
+--- a/README.md
++++ b/README.md
+@@ -30,29 +30,45 @@ Laravel 11 is dropped: every `laravel/framework` 11.x release is flagged by an u
+ - Requires `illuminate/cache`, `illuminate/config`, `illuminate/contracts`, `illuminate/http`, `illuminate/routing`, `illuminate/support`, `illuminate/view` (`^12.0 || ^13.0`) — see `composer.json`.
+ - Counterparty service: [AllSystems](https://github.com/allsystems-live) sends the signed `maintenance.started` / `maintenance.ended` / `ping` webhooks this package verifies and consumes.
+ - Consumed by any Laravel application that installs `allsystems/laravel` via Composer; consuming applications are not tracked in this repo.
+ 
+ ## Install
+ 
+ Add the repository, then require the package:
+ 
+ ```bash
+ composer config repositories.allsystems vcs https://github.com/allsystems-live/laravel
+-composer require allsystems/laravel:^0.1.0
++composer require allsystems/laravel:^0.2.0
+ ```
+ 
+ Add `\AllSystems\Laravel\Http\Middleware\PlatformMaintenanceMiddleware::class` to the global middleware, after `HandleCors`: after it so browser callers can read the 503, and before any database work.
+ 
+ The default cache store must be shared across instances (DynamoDB or Redis on Lambda), never `array` or `file`, or instances will disagree about the window.
+ 
+ Set `ALLSYSTEMS_WEBHOOK_SECRET` to the secret shown on the application's page in AllSystems, and register `https://your-app.example/webhooks/allsystems` there as the webhook URL.
+ 
++## Intercepting a window
++
++An app that needs to claim a maintenance window itself, before the platform window changes, implements `AllSystems\Laravel\Contracts\MaintenanceInterceptor` and binds it.
++
++`started()` runs for a signed, valid `maintenance.started` and `ended()` for a signed, valid `maintenance.ended`. Neither runs for a ping, an unknown event, a `401` or a `400`.
++
++Returning `activated` or `noop` from `started()`, or `deactivated` from `ended()`, makes that value the webhook answer and leaves the platform window alone. Returning null, or any other value, falls through to the normal behaviour: the platform window opens or closes.
++
++```php
++use AllSystems\Laravel\Contracts\MaintenanceInterceptor;
++
++$this->app->bind(MaintenanceInterceptor::class, YourInterceptor::class);
++```
++
++Put the binding in a service provider's `register()`. With nothing bound, the package behaves as before.
++
+ ## Run it
+ 
+ Prerequisites: PHP 8.2–8.4, Composer.
+ 
+ ```bash
+ composer install
+ ```
+ 
+ Run the tests:
+ 
+diff --git a/docs/superpowers/plans/AS-403-allsystems-laravel-apps-can-intercept-a.md b/docs/superpowers/plans/AS-403-allsystems-laravel-apps-can-intercept-a.md
+new file mode 100644
+index 0000000..511e242
+--- /dev/null
++++ b/docs/superpowers/plans/AS-403-allsystems-laravel-apps-can-intercept-a.md
+@@ -0,0 +1,67 @@
++# AS-403: allsystems/laravel: apps can intercept a window; v0.2.0
++Ticket: AS-403 @ 2026-11-24T10:33:01.799+0000
++
++## Global Constraints
++
++- All gates green before the PR, run from the orchestrator root: `bash scripts/run-gates.sh --repo laravel AS-403-allsystems-laravel-apps-can-intercept-a` (gates: `pint-test`, `analyse`, `phpunit`; one at a time with `--only pint|analyse|test`). This is `composer check` (pint --test, phpstan, phpunit); CI repeats it across the PHP 8.2-8.4 x Laravel 12-13 matrix.
++- No weakened invariant: phpstan level and baseline untouched, no `@phpstan-ignore`, no test skipped or loosened. Every existing case in `tests/WebhookTest.php` stays byte-for-byte unchanged (AC 2 is proven by it passing with nothing bound).
++- No auto-merge. No tag or release: Josh cuts v0.2.0 after merge (`gh release-train rc -R allsystems-live/laravel minor`, then `promote`).
++- Does not touch: `VerifySignature`, `PlatformMaintenance`, `PlatformMaintenanceMiddleware`, `AllSystemsServiceProvider` (no default binding: the container falls back to the constructor default), `config/allsystems.php`, `routes/webhook.php`, the bundled view, `composer.json`, CI files.
++- Project skills: none
++
++## Chunk 1: the interceptor contract and the controller hook
++
++**Files**
++- Create: src/Contracts/MaintenanceInterceptor.php
++- Modify: src/Http/Controllers/WebhookController.php
++- Test: tests/MaintenanceInterceptorTest.php
++
++**Interfaces**
++- Hands later chunks: `AllSystems\Laravel\Contracts\MaintenanceInterceptor` with `started(string $windowId, array $payload): ?string` (docblock `@param array<string, mixed> $payload`, `@return 'activated'|'noop'|null`; null lets the platform window open) and `ended(string $windowId, array $payload): ?string` (`@return 'deactivated'|null`; null lets `PlatformMaintenance::end()` run). Interface docblock: an app binds it in a service provider's `register()` to claim a window before the platform window opens or closes.
++- `WebhookController::__construct(private readonly PlatformMaintenance $maintenance, private readonly ?MaintenanceInterceptor $interceptor = null)`.
++
++**Behaviour**
++- Class docblock gains: "An app may bind MaintenanceInterceptor to claim a window before the platform window opens or closes."
++- Nothing before the `$id` check changes, so ping, unknown events, 400s and (in the middleware) 401s never reach the interceptor.
++- After the `$id` check, replace the single ternary with two branches: for `maintenance.ended`, `$action = $this->interceptor?->ended($id, $payload)`; answer `$action` when it is exactly `'deactivated'`, otherwise answer `$this->maintenance->end($id)`. For `maintenance.started`, `$action = $this->interceptor?->started($id, $payload)`; answer it when it is `'activated'` or `'noop'` (strict `in_array`), otherwise `$this->maintenance->start($id)`. Any other string is treated as null.
++- `$payload` passed is the already-decoded array (`array<mixed>` from `json_decode`); if phpstan objects to passing it as `array<string, mixed>`, narrow with a `/** @var array<string, mixed> $payload */` on the decoded value rather than loosening the interface docblock.
++- Nothing is bound by the provider. Laravel's container, on `BindingResolutionException` for an unbound interface parameter that has a default value, passes the default (`Container::resolveClass()`), so `null` arrives when no app binds the interface. A test in this chunk proves it.
++
++**Test scenarios** (new `tests/MaintenanceInterceptorTest.php`, extends `TestCase`)
++- A recording test double, an anonymous class built in `defineEnvironment()` and implementing the interface: per-test configurable returns for `started()`/`ended()`, records every call as `[method, windowId, payload]`. Bind it with `$app->instance(MaintenanceInterceptor::class, $double)` in `defineEnvironment()`.
++- Copy the four private helpers (`maintenance()`, `body()`, `header()`, `deliver()`/`send()`) from `tests/WebhookTest.php` into the new test; do not extract them from `WebhookTest.php` (its cases stay unchanged).
++- `testStartedClaimedAsActivatedLeavesThePlatformWindowShut`: answer `activated`, `isActive()` false, the double recorded `started` with the id and the decoded body (assert the full array, using a body that carries `components`).
++- `testStartedClaimedAsNoopLeavesThePlatformWindowShut`: answer `noop`, `isActive()` false.
++- `testStartedNotClaimedOpensThePlatformWindow`: double returns null; answer `activated`, `isActive()` true.
++- `testEndedClaimedLeavesTheOpenWindowOpen`: open window-1 with started (double returns null), then ended window-1 with double returning `deactivated`; answer `deactivated`, `isActive()` still true, double recorded `ended` with the id and body.
++- `testEndedNotClaimedClosesTheOpenWindow`: same setup, ended returns null; answer `deactivated`, `isActive()` false.
++- `testOutOfContractReturnsAreTreatedAsNull` (data provider): `started()` returning `'deactivated'` (and `'ignored'`) opens the window and answers `activated`; `ended()` returning `'noop'` closes the open window and answers `deactivated`.
++- `testTheInterceptorIsNotCalledFor` (data provider): ping, unknown event, bad signature (wrong v1), invalid body (non-JSON, and a started body with an empty id); the double records no call.
++- `testUnboundInterceptorResolvesToNull`: in a test that does not bind (gate the binding in `defineEnvironment()` on `$this->name()`, as `WebhookTest` does), `app(WebhookController::class)` resolves and a started delivery answers `activated` with the window open.
++
++**ACs met**: 1, 2 (with the unchanged `WebhookTest.php`), 3, 4, 5, 6, 8 (for the code).
++
++## Chunk 2: docs and changelog for v0.2.0
++
++**Files**
++- Modify: README.md (new "Intercepting a window" section after Install; require line in Install bumped to `^0.2.0` so the documented feature is installable)
++- Modify: docs/webhook-contract.md (processing order under "The webhook contract")
++- Modify: CHANGELOG.md (a `## v0.2.0` section above v0.1.0)
++
++**Interfaces**
++- Consumes the interface and controller behaviour from chunk 1; hands nothing on.
++
++**Behaviour**
++- README "Intercepting a window" (between `## Install` and `## Run it`): what the interface is for (an app claims a window before the platform window changes), when each method runs (`started()` on a signed, valid `maintenance.started`; `ended()` on a signed, valid `maintenance.ended`; never for ping, unknown events, 401 or 400), what each return means (`activated`/`noop` from `started()` and `deactivated` from `ended()` become the webhook answer and the platform window is left alone; null, or any other value, falls through to the v0.1.0 behaviour), and the binding: `$this->app->bind(MaintenanceInterceptor::class, YourInterceptor::class);` in a service provider's `register()`, with the `use AllSystems\Laravel\Contracts\MaintenanceInterceptor;` line.
++- docs/webhook-contract.md, inside "The webhook contract" (after the Responses paragraph, before Idempotency): a short "Processing order" paragraph or list: signature (401), body (400; ping answers noop, unknown events ignored), the app's `MaintenanceInterceptor` if one is bound, then the platform window. State that a claimed window does not touch the platform window, and that receivers in other languages can ignore the step.
++- CHANGELOG: `## v0.2.0` with "Optional `MaintenanceInterceptor`: an app can claim a `maintenance.started` or `maintenance.ended` before the platform window changes." plus one line that nothing changes when it is not bound.
++- Markdown: one line per paragraph, no hard wrapping.
++
++**Test scenarios**
++- None beyond the full gate run (`bash scripts/run-gates.sh --repo laravel AS-403-allsystems-laravel-apps-can-intercept-a`), which must be green after this chunk.
++
++**ACs met**: 7, 8.
++
++## Notes
++
++- Simplest approach: an optional nullable constructor argument resolved by the container, no provider binding, no config key (the ticket rejects both alternatives).
+diff --git a/docs/webhook-contract.md b/docs/webhook-contract.md
+index 1aa5527..6536a9c 100644
+--- a/docs/webhook-contract.md
++++ b/docs/webhook-contract.md
+@@ -74,20 +74,22 @@ Headers:
+ ```
+ 
+ `ping`:
+ 
+ ```json
+ { "event": "ping", "application": { "id": "...", "name": "..." } }
+ ```
+ 
+ **Responses.** Every answer is JSON. `200 {"action":"activated"}` and `{"action":"deactivated"}` when the window changed; `{"action":"noop"}` for a redelivered `started`, an `ended` for a window that is not the open one (including "nothing is open") and a `ping`; `{"action":"ignored"}` for an event type this package does not know. `401 {"error":"Invalid signature"}` and `400 {"error":"Invalid payload"}` otherwise.
+ 
++**Processing order.** The signature is checked first (`401`), then the body (`400`; a ping answers `noop` and an unknown event is ignored). For `maintenance.started` and `maintenance.ended`, the app's `MaintenanceInterceptor` runs next if one is bound, then the platform window. A window the interceptor claims does not touch the platform window. This step is specific to the Laravel package; receivers in other languages can ignore it.
++
+ **Idempotency.** The key is `(id, event)`; see The window for the two noop cases.
+ 
+ **Delivery semantics.** Any `2xx` response is success. Anything else — a non-2xx status, a timeout, or a transport error — is retried, six times over roughly nineteen minutes, and then given up on.
+ 
+ ## Golden test vector
+ 
+ Secret, timestamp and body below are fixed constants — check your own HMAC implementation against them in any language in about five minutes.
+ 
+ ```
+ secret    = whsec_test_31d4a1f7c0b84e6fa9d2c5e8b7043f16
+diff --git a/src/Contracts/MaintenanceInterceptor.php b/src/Contracts/MaintenanceInterceptor.php
+new file mode 100644
+index 0000000..0fe8fe9
+--- /dev/null
++++ b/src/Contracts/MaintenanceInterceptor.php
+@@ -0,0 +1,27 @@
++<?php
++
++declare(strict_types=1);
++
++namespace AllSystems\Laravel\Contracts;
++
++/**
++ * An app binds this in a service provider's register() to claim a window before the platform window opens or closes.
++ *
++ * Only signed, valid maintenance deliveries reach it. Any return outside the documented values is treated as null.
++ */
++interface MaintenanceInterceptor
++{
++    /**
++     * @param array<string, mixed> $payload
++     *
++     * @return 'activated'|'noop'|null null lets the platform window open
++     */
++    public function started(string $windowId, array $payload): ?string;
++
++    /**
++     * @param array<string, mixed> $payload
++     *
++     * @return 'deactivated'|null null lets PlatformMaintenance::end() run
++     */
++    public function ended(string $windowId, array $payload): ?string;
++}
+diff --git a/src/Http/Controllers/WebhookController.php b/src/Http/Controllers/WebhookController.php
+index 0a963ec..f09697a 100644
+--- a/src/Http/Controllers/WebhookController.php
++++ b/src/Http/Controllers/WebhookController.php
+@@ -1,31 +1,35 @@
+ <?php
+ 
+ declare(strict_types=1);
+ 
+ namespace AllSystems\Laravel\Http\Controllers;
+ 
++use AllSystems\Laravel\Contracts\MaintenanceInterceptor;
+ use AllSystems\Laravel\PlatformMaintenance;
+ use Illuminate\Http\JsonResponse;
+ use Illuminate\Http\Request;
+ use JsonException;
+ 
+ /**
+  * Applies a signed AllSystems delivery to the platform maintenance window.
+  *
+  * The event comes from the signed body, never the X-AllSystems-Event header, which the signature does not cover.
+  * Unknown events answer 200 `ignored`, so a future event type is not retried by every deployed receiver.
++ * An app may bind MaintenanceInterceptor to claim a window before the platform window opens or closes.
+  */
+ final class WebhookController
+ {
+-    public function __construct(private readonly PlatformMaintenance $maintenance)
+-    {
++    public function __construct(
++        private readonly PlatformMaintenance $maintenance,
++        private readonly ?MaintenanceInterceptor $interceptor = null,
++    ) {
+     }
+ 
+     public function __invoke(Request $request): JsonResponse
+     {
+         try {
+             $payload = json_decode($request->getContent(), true, 512, JSON_THROW_ON_ERROR);
+         } catch (JsonException) {
+             return $this->invalid();
+         }
+ 
+@@ -40,22 +44,31 @@ final class WebhookController
+         if ($payload['event'] !== 'maintenance.started' && $payload['event'] !== 'maintenance.ended') {
+             return $this->answer('ignored');
+         }
+ 
+         $id = $payload['id'] ?? null;
+ 
+         if (!is_string($id) || $id === '') {
+             return $this->invalid();
+         }
+ 
++        /** @var array<string, mixed> $payload */
++        if ($payload['event'] === 'maintenance.ended') {
++            $action = $this->interceptor?->ended($id, $payload);
++
++            return $this->answer($action === 'deactivated' ? $action : $this->maintenance->end($id));
++        }
++
++        $action = $this->interceptor?->started($id, $payload);
++
+         return $this->answer(
+-            $payload['event'] === 'maintenance.ended' ? $this->maintenance->end($id) : $this->maintenance->start($id),
++            in_array($action, ['activated', 'noop'], true) ? $action : $this->maintenance->start($id),
+         );
+     }
+ 
+     private function invalid(): JsonResponse
+     {
+         return new JsonResponse(['error' => 'Invalid payload'], 400);
+     }
+ 
+     private function answer(string $action): JsonResponse
+     {
+diff --git a/tests/MaintenanceInterceptorTest.php b/tests/MaintenanceInterceptorTest.php
+new file mode 100644
+index 0000000..01e5ebe
+--- /dev/null
++++ b/tests/MaintenanceInterceptorTest.php
+@@ -0,0 +1,202 @@
++<?php
++
++declare(strict_types=1);
++
++namespace AllSystems\Laravel\Tests;
++
++use AllSystems\Laravel\Contracts\MaintenanceInterceptor;
++use AllSystems\Laravel\Http\Controllers\WebhookController;
++use AllSystems\Laravel\Http\Middleware\VerifySignature;
++use AllSystems\Laravel\PlatformMaintenance;
++use Illuminate\Foundation\Application;
++use Illuminate\Testing\TestResponse;
++use PHPUnit\Framework\Attributes\DataProvider;
++
++final class MaintenanceInterceptorTest extends TestCase
++{
++    private const URL = 'http://localhost/webhooks/allsystems';
++
++    private RecordingInterceptor $double;
++
++    protected function defineEnvironment($app): void
++    {
++        parent::defineEnvironment($app);
++
++        assert($app instanceof Application);
++
++        $this->double = new RecordingInterceptor();
++
++        if ($this->name() !== 'testUnboundInterceptorResolvesToNull') {
++            $app->instance(MaintenanceInterceptor::class, $this->double);
++        }
++    }
++
++    public function testStartedClaimedAsActivatedLeavesThePlatformWindowShut(): void
++    {
++        $this->double->started = 'activated';
++        $body = $this->fullBody('maintenance.started', 'window-1');
++
++        $this->deliver($body)->assertOk()->assertExactJson(['action' => 'activated']);
++
++        self::assertFalse($this->maintenance()->isActive());
++        self::assertSame([['started', 'window-1', json_decode($body, true)]], $this->double->calls);
++    }
++
++    public function testStartedClaimedAsNoopLeavesThePlatformWindowShut(): void
++    {
++        $this->double->started = 'noop';
++
++        $this->deliver($this->body('maintenance.started', 'window-1'))->assertOk()->assertExactJson(['action' => 'noop']);
++        self::assertFalse($this->maintenance()->isActive());
++    }
++
++    public function testStartedNotClaimedOpensThePlatformWindow(): void
++    {
++        $this->deliver($this->body('maintenance.started', 'window-1'))->assertOk()->assertExactJson(['action' => 'activated']);
++        self::assertTrue($this->maintenance()->isActive());
++    }
++
++    public function testEndedClaimedLeavesTheOpenWindowOpen(): void
++    {
++        $this->deliver($this->body('maintenance.started', 'window-1'))->assertOk();
++        $this->double->ended = 'deactivated';
++        $body = $this->fullBody('maintenance.ended', 'window-1');
++
++        $this->deliver($body)->assertOk()->assertExactJson(['action' => 'deactivated']);
++
++        self::assertTrue($this->maintenance()->isActive());
++        self::assertSame(['ended', 'window-1', json_decode($body, true)], $this->double->calls[1]);
++    }
++
++    public function testEndedNotClaimedClosesTheOpenWindow(): void
++    {
++        $this->deliver($this->body('maintenance.started', 'window-1'))->assertOk();
++
++        $this->deliver($this->body('maintenance.ended', 'window-1'))->assertOk()->assertExactJson(['action' => 'deactivated']);
++        self::assertFalse($this->maintenance()->isActive());
++    }
++
++    /** @return array<string, array{string, string, string}> */
++    public static function outOfContractReturns(): array
++    {
++        return [
++            'started deactivated' => ['started', 'deactivated', 'activated'],
++            'started ignored' => ['started', 'ignored', 'activated'],
++            'ended noop' => ['ended', 'noop', 'deactivated'],
++        ];
++    }
++
++    /** @param 'activated'|'noop'|'deactivated'|'ignored' $returned */
++    #[DataProvider('outOfContractReturns')]
++    public function testOutOfContractReturnsAreTreatedAsNull(string $method, string $returned, string $expected): void
++    {
++        if ($method === 'ended') {
++            $this->deliver($this->body('maintenance.started', 'window-1'))->assertOk();
++        }
++
++        $method === 'started' ? $this->double->started = $returned : $this->double->ended = $returned;
++
++        $this->deliver($this->body("maintenance.{$method}", 'window-1'))->assertOk()->assertExactJson(['action' => $expected]);
++        self::assertSame($method === 'started', $this->maintenance()->isActive());
++    }
++
++    /** @return array<string, array{string, bool}> */
++    public static function undeliveredCases(): array
++    {
++        return [
++            'ping' => ['{"event":"ping"}', true],
++            'unknown event' => ['{"event":"maintenance.rescheduled","id":"window-1"}', true],
++            'bad signature' => ['{"event":"maintenance.started","id":"window-1"}', false],
++            'not json' => ['not json', true],
++            'empty id' => ['{"event":"maintenance.started","id":""}', true],
++        ];
++    }
++
++    #[DataProvider('undeliveredCases')]
++    public function testTheInterceptorIsNotCalledFor(string $body, bool $signed): void
++    {
++        $signed
++            ? $this->deliver($body)
++            : $this->send($body, $this->header($this->clock->now()->getTimestamp(), $body . ' '));
++
++        self::assertSame([], $this->double->calls);
++    }
++
++    public function testUnboundInterceptorResolvesToNull(): void
++    {
++        self::assertInstanceOf(WebhookController::class, $this->app?->make(WebhookController::class));
++
++        $this->deliver($this->body('maintenance.started', 'window-1'))->assertOk()->assertExactJson(['action' => 'activated']);
++        self::assertTrue($this->maintenance()->isActive());
++    }
++
++    private function maintenance(): PlatformMaintenance
++    {
++        $maintenance = $this->app?->make(PlatformMaintenance::class);
++        assert($maintenance instanceof PlatformMaintenance);
++
++        return $maintenance;
++    }
++
++    private function body(string $event, string $id): string
++    {
++        return json_encode(['id' => $id, 'event' => $event], JSON_THROW_ON_ERROR);
++    }
++
++    private function fullBody(string $event, string $id): string
++    {
++        return json_encode([
++            'id' => $id,
++            'event' => $event,
++            'title' => 'Database upgrade',
++            'components' => [['id' => 'c1', 'name' => 'Web app']],
++        ], JSON_THROW_ON_ERROR);
++    }
++
++    private function header(int $timestamp, string $signedBody): string
++    {
++        return "t={$timestamp},v1=" . hash_hmac('sha256', $timestamp . '.' . $signedBody, self::SECRET);
++    }
++
++    /** @return TestResponse<\Symfony\Component\HttpFoundation\Response> */
++    private function deliver(string $body): TestResponse
++    {
++        return $this->send($body, $this->header($this->clock->now()->getTimestamp(), $body));
++    }
++
++    /** @return TestResponse<\Symfony\Component\HttpFoundation\Response> */
++    private function send(string $body, string $signature): TestResponse
++    {
++        $headers = $this->transformHeadersToServerVars([VerifySignature::HEADER => $signature]);
++
++        return $this->call('POST', self::URL, [], [], [], $headers, $body);
++    }
++}
++
++final class RecordingInterceptor implements MaintenanceInterceptor
++{
++    /** @var 'activated'|'noop'|'deactivated'|'ignored'|null */
++    public ?string $started = null;
++
++    /** @var 'activated'|'noop'|'deactivated'|'ignored'|null */
++    public ?string $ended = null;
++
++    /** @var list<array{string, string, array<string, mixed>}> */
++    public array $calls = [];
++
++    /** @return 'activated'|'noop'|'deactivated'|'ignored'|null */
++    public function started(string $windowId, array $payload): ?string
++    {
++        $this->calls[] = ['started', $windowId, $payload];
++
++        return $this->started;
++    }
++
++    /** @return 'activated'|'noop'|'deactivated'|'ignored'|null */
++    public function ended(string $windowId, array $payload): ?string
++    {
++        $this->calls[] = ['ended', $windowId, $payload];
++
++        return $this->ended;
++    }
++}
