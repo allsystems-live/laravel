@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace AllSystems\Laravel\Http\Controllers;
 
+use AllSystems\Laravel\Contracts\MaintenanceInterceptor;
 use AllSystems\Laravel\PlatformMaintenance;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -14,11 +15,14 @@ use JsonException;
  *
  * The event comes from the signed body, never the X-AllSystems-Event header, which the signature does not cover.
  * Unknown events answer 200 `ignored`, so a future event type is not retried by every deployed receiver.
+ * An app may bind MaintenanceInterceptor to claim a window before the platform window opens or closes.
  */
 final class WebhookController
 {
-    public function __construct(private readonly PlatformMaintenance $maintenance)
-    {
+    public function __construct(
+        private readonly PlatformMaintenance $maintenance,
+        private readonly ?MaintenanceInterceptor $interceptor = null,
+    ) {
     }
 
     public function __invoke(Request $request): JsonResponse
@@ -47,8 +51,17 @@ final class WebhookController
             return $this->invalid();
         }
 
+        /** @var array<string, mixed> $payload */
+        if ($payload['event'] === 'maintenance.ended') {
+            $action = $this->interceptor?->ended($id, $payload);
+
+            return $this->answer($action === 'deactivated' ? $action : $this->maintenance->end($id));
+        }
+
+        $action = $this->interceptor?->started($id, $payload);
+
         return $this->answer(
-            $payload['event'] === 'maintenance.ended' ? $this->maintenance->end($id) : $this->maintenance->start($id),
+            in_array($action, ['activated', 'noop'], true) ? $action : $this->maintenance->start($id),
         );
     }
 
