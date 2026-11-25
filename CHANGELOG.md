@@ -2,6 +2,11 @@
 
 All notable changes to `allsystems/laravel` are documented here.
 
+## v0.2.0
+
+- Optional `MaintenanceInterceptor`: an app can claim a `maintenance.started` or `maintenance.ended` before the platform window changes.
+- Nothing changes when no interceptor is bound.
+
 ## v0.1.0
 
 - Signed webhook at `POST {allsystems.path}` (default `webhooks/allsystems`, optionally restricted to `allsystems.domain`) with no CSRF, session or auth middleware: the HMAC signature is the authentication.

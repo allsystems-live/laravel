@@ -37,7 +37,7 @@ Add the repository, then require the package:
 
 ```bash
 composer config repositories.allsystems vcs https://github.com/allsystems-live/laravel
-composer require allsystems/laravel:^0.1.0
+composer require allsystems/laravel:^0.2.0
 ```
 
 Add `\AllSystems\Laravel\Http\Middleware\PlatformMaintenanceMiddleware::class` to the global middleware, after `HandleCors`: after it so browser callers can read the 503, and before any database work.
@@ -45,6 +45,22 @@ Add `\AllSystems\Laravel\Http\Middleware\PlatformMaintenanceMiddleware::class` t
 The default cache store must be shared across instances (DynamoDB or Redis on Lambda), never `array` or `file`, or instances will disagree about the window.
 
 Set `ALLSYSTEMS_WEBHOOK_SECRET` to the secret shown on the application's page in AllSystems, and register `https://your-app.example/webhooks/allsystems` there as the webhook URL.
+
+## Intercepting a window
+
+An app that needs to claim a maintenance window itself, before the platform window changes, implements `AllSystems\Laravel\Contracts\MaintenanceInterceptor` and binds it.
+
+`started()` runs for a signed, valid `maintenance.started` and `ended()` for a signed, valid `maintenance.ended`. Neither runs for a ping, an unknown event, a `401` or a `400`.
+
+Returning `activated` or `noop` from `started()`, or `deactivated` from `ended()`, makes that value the webhook answer and leaves the platform window alone. Returning null, or any other value, falls through to the normal behaviour: the platform window opens or closes.
+
+```php
+use AllSystems\Laravel\Contracts\MaintenanceInterceptor;
+
+$this->app->bind(MaintenanceInterceptor::class, YourInterceptor::class);
+```
+
+Put the binding in a service provider's `register()`. With nothing bound, every maintenance delivery opens or closes the platform window.
 
 ## Run it
 
